@@ -1,0 +1,30 @@
+# ── Dependencies ──────────────────────────────────────────────
+node_modules/
+
+# ── Secrets — NEVER commit ────────────────────────────────────
+.env
+.env.*
+!.env.example
+!frontend/.env.production
+
+# ── Customer data, encryption key, backups (personal data!) ──
+backend/data/
+backend/backups/
+backend/uploads_temp/
+*.key
+
+# ── OCR language data (downloaded during setup) ───────────────
+backend/ocr-data/
+*.traineddata
+
+# ── Builds and logs (logs can contain customer file names) ────
+frontend/build/
+*.log
+npm-debug.log*
+
+# ── OS / editor ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

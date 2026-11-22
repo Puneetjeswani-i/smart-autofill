@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Autofill</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { width:340px; background:#1e1e2e; color:#cdd6f4; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; font-size:13px; overflow-x:hidden; }
+
+    /* Header */
+    .header { background:linear-gradient(135deg,#313244,#1e1e2e); padding:14px 16px; display:flex; align-items:center; gap:10px; border-bottom:1px solid #313244; }
+    .logo { width:32px; height:32px; background:linear-gradient(135deg,#cba6f7,#89b4fa); border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:16px; flex-shrink:0; }
+    .header-title { font-size:15px; font-weight:700; color:#cba6f7; }
+    .header-sub { font-size:10px; color:#6c7086; margin-top:1px; }
+    .status-dot { width:8px; height:8px; border-radius:50%; margin-left:auto; flex-shrink:0; }
+    .status-dot.ok { background:#a6e3a1; box-shadow:0 0 6px #a6e3a1; }
+    .status-dot.error { background:#f38ba8; box-shadow:0 0 6px #f38ba8; }
+    .status-dot.loading { background:#f9e2af; animation:pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    /* States */
+    .hidden { display:none !important; }
+    .state-card { padding:24px 20px; text-align:center; }
+    .state-icon { font-size:36px; margin-bottom:12px; }
+    .state-title { font-size:14px; font-weight:600; color:#cdd6f4; margin-bottom:6px; }
+    .state-sub { font-size:12px; color:#6c7086; line-height:1.5; }
+
+    /* Profile card */
+    .profile-card { margin:12px; background:#181825; border-radius:12px; border:1px solid #313244; padding:14px; }
+    .profile-name { font-size:15px; font-weight:700; color:#cba6f7; margin-bottom:6px; }
+    .profile-meta { display:flex; flex-wrap:wrap; gap:6px; }
+    .meta-badge { background:#313244; color:#a6adc8; padding:3px 8px; border-radius:20px; font-size:10px; }
+    .docs-row { display:flex; flex-wrap:wrap; gap:4px; margin-top:8px; }
+    .doc-chip { background:#1e3a4a; color:#89dceb; padding:2px 7px; border-radius:12px; font-size:10px; }
+
+    /* Completeness */
+    .readiness { margin:0 12px; }
+    .readiness-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+    .readiness-label { font-size:11px; color:#6c7086; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; }
+    .readiness-score { font-size:13px; font-weight:700; }
+    .score-high { color:#a6e3a1; }
+    .score-med { color:#f9e2af; }
+    .score-low { color:#f38ba8; }
+    .readiness-bar { height:4px; background:#313244; border-radius:2px; overflow:hidden; }
+    .readiness-fill { height:100%; border-radius:2px; transition:width 0.4s ease; }
+
+    /* Fields detected */
+    .section { margin:10px 12px; }
+    .section-label { font-size:10px; color:#6c7086; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; }
+    .no-fields { color:#585b70; font-size:12px; text-align:center; padding:10px 0; }
+    .fields-grid { display:flex; flex-direction:column; gap:4px; max-height:160px; overflow-y:auto; }
+    .field-row { display:flex; align-items:center; gap:8px; background:#181825; padding:6px 10px; border-radius:8px; border:1px solid #313244; }
+    .field-name { color:#89b4fa; font-size:11px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .field-arrow { color:#45475a; font-size:10px; }
+    .field-match { color:#a6adc8; font-size:10px; flex-shrink:0; }
+    .conf-dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+    .conf-high { background:#a6e3a1; }
+    .conf-med { background:#f9e2af; }
+    .conf-low { background:#f38ba8; }
+
+    /* Buttons */
+    .actions { padding:10px 12px 14px; display:flex; flex-direction:column; gap:6px; }
+    .btn { width:100%; padding:10px; border-radius:10px; border:none; cursor:pointer; font-size:13px; font-weight:600; transition:all 0.2s; display:flex; align-items:center; justify-content:center; gap:6px; }
+    .btn:disabled { opacity:0.5; cursor:not-allowed; }
+    .btn-primary { background:linear-gradient(135deg,#6c5ce7,#a855f7); color:#fff; }
+    .btn-primary:hover:not(:disabled) { transform:translateY(-1px); box-shadow:0 4px 15px rgba(108,92,231,0.4); }
+    .btn-secondary { background:#313244; color:#cdd6f4; }
+    .btn-secondary:hover:not(:disabled) { background:#45475a; }
+    .btn-ghost { background:transparent; color:#6c7086; font-size:11px; padding:6px; }
+    .btn-ghost:hover { color:#a6adc8; }
+    .btn-danger { background:#3a1e1e; color:#f38ba8; border:1px solid #5a2d2d; }
+    .btn-danger:hover:not(:disabled) { background:#4a2020; }
+
+    /* Preview toggle */
+    .preview-toggle { display:flex; align-items:center; gap:6px; padding:0 12px 8px; }
+    .toggle-label { font-size:11px; color:#6c7086; flex:1; }
+    .toggle { position:relative; width:32px; height:18px; }
+    .toggle input { opacity:0; width:0; height:0; }
+    .toggle-slider { position:absolute; inset:0; background:#313244; border-radius:9px; cursor:pointer; transition:0.2s; }
+    .toggle-slider::after { content:''; position:absolute; left:2px; top:2px; width:14px; height:14px; background:#6c7086; border-radius:50%; transition:0.2s; }
+    input:checked + .toggle-slider { background:#6c5ce7; }
+    input:checked + .toggle-slider::after { transform:translateX(14px); background:#fff; }
+
+    /* Result */
+    .result { margin:0 12px 10px; padding:8px 12px; border-radius:8px; font-size:12px; font-weight:600; text-align:center; }
+    .result.success { background:#1e3a1e; color:#a6e3a1; border:1px solid #2d5a2d; }
+    .result.error { background:#3a1e1e; color:#f38ba8; border:1px solid #5a2d2d; }
+    .result.info { background:#1e2d3a; color:#89b4fa; border:1px solid #2d4a5a; }
+
+    /* Missing docs alert */
+    .alert { margin:0 12px 8px; background:#3a2e1e; border:1px solid #f9e2af44; border-radius:8px; padding:8px 10px; }
+    .alert-title { font-size:10px; color:#f9e2af; font-weight:700; text-transform:uppercase; margin-bottom:4px; }
+    .alert-item { font-size:10px; color:#cba6f7; margin:2px 0; }
+
+    /* Scheme chips */
+    .schemes { margin:0 12px 8px; display:flex; flex-wrap:wrap; gap:4px; }
+    .scheme-chip { background:#1e2d3a; color:#74c7ec; border:1px solid #74c7ec33; padding:3px 8px; border-radius:12px; font-size:10px; cursor:pointer; }
+    .scheme-chip:hover { background:#74c7ec22; }
+
+    scrollbar-width: thin;
+    scrollbar-color: #313244 transparent;
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="logo">⚡</div>
+  <div>
+    <div class="header-title">Smart Autofill</div>
+    <div class="header-sub" id="sessionLabel">eMitra / CSC Assistant</div>
+  </div>
+  <div style="display:flex;align-items:center;gap:6px;margin-left:auto">
+    <button id="refreshBtn" title="Refresh profile from dashboard" style="background:none;border:none;cursor:pointer;color:#6c7086;font-size:14px;padding:2px 4px;line-height:1">↺</button>
+    <div class="status-dot loading" id="statusDot"></div>
+  </div>
+</div>
+
+<!-- Loading -->
+<div id="loadingState" class="state-card">
+  <div class="state-icon">⏳</div>
+  <div class="state-title">Connecting...</div>
+  <div class="state-sub">Loading citizen profile</div>
+</div>
+
+<!-- Error -->
+<div id="errorState" class="state-card hidden">
+  <div class="state-icon">⚠️</div>
+  <div class="state-title">Cannot connect to backend</div>
+  <div class="state-sub">Make sure the Smart Autofill backend is running on localhost:3001</div>
+  <button class="btn btn-secondary" style="margin-top:14px;width:auto;padding:8px 16px;" id="retryBtn">↺ Retry</button>
+</div>
+
+<!-- No Profile -->
+<div id="noProfileState" class="state-card hidden">
+  <div class="state-icon">📂</div>
+  <div class="state-title">No Citizen Profile Found</div>
+  <div class="state-sub">Upload documents in the dashboard to create a profile, then click <strong>Refresh</strong> or reopen this popup.</div>
+  <button class="btn btn-primary" style="margin-top:14px;" id="openDashBtn">Open Dashboard →</button>
+  <button class="btn btn-secondary" style="margin-top:8px;" id="retryBtn2">↺ Refresh Profile</button>
+</div>
+
+<!-- Main -->
+<div id="mainState" class="hidden">
+
+  <!-- Profile summary -->
+  <div class="profile-card">
+    <div id="profileCard">
+      <div class="profile-name">Loading...</div>
+    </div>
+  </div>
+
+  <!-- Readiness score -->
+  <div class="readiness" id="readinessSection" style="margin-top:10px">
+    <div class="readiness-header">
+      <span class="readiness-label">Application Readiness</span>
+      <span class="readiness-score" id="readinessScore">—</span>
+    </div>
+    <div class="readiness-bar"><div class="readiness-fill" id="readinessFill" style="width:0%"></div></div>
+  </div>
+
+  <!-- Missing docs alert -->
+  <div id="alertSection" class="alert hidden" style="margin-top:8px">
+    <div class="alert-title">⚠ Attention</div>
+    <div id="alertItems"></div>
+  </div>
+
+  <!-- Suggested schemes -->
+  <div class="section" id="schemesSection" style="display:none">
+    <div class="section-label">Detected Schemes</div>
+    <div class="schemes" id="schemesChips"></div>
+  </div>
+
+  <!-- Detected fields on current page -->
+  <div class="section">
+    <div class="section-label">Fields on this page</div>
+    <div class="fields-grid" id="fieldsDetected">
+      <div class="no-fields">Scanning page...</div>
+    </div>
+  </div>
+
+  <!-- Preview toggle -->
+  <div class="preview-toggle">
+    <span class="toggle-label">Show preview before filling</span>
+    <label class="toggle">
+      <input type="checkbox" id="previewToggle" checked>
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+
+  <!-- Actions -->
+  <div class="actions">
+    <button class="btn btn-primary" id="autofillBtn" disabled>⚡ Autofill This Page</button>
+    <button class="btn btn-secondary" id="openDashBtn2">📊 Open Dashboard</button>
+    <button class="btn btn-danger" id="newPersonBtn" title="Clear current profile and load a new person">👤 New Person / Clear Profile</button>
+  </div>
+
+  <!-- Result -->
+  <div class="result hidden" id="fillResult"></div>
+
+  <!-- New Person Confirm -->
+  <div id="confirmClearState" class="hidden" style="margin:0 12px 10px;background:#3a1e1e;border:1px solid #5a2d2d;border-radius:10px;padding:14px;">
+    <div style="font-size:13px;font-weight:600;color:#f38ba8;margin-bottom:8px;">⚠ Clear current profile?</div>
+    <div style="font-size:11px;color:#a6adc8;margin-bottom:12px;line-height:1.5;">
+      This will delete <strong style="color:#f38ba8" id="clearPersonName">the current profile</strong> from the backend so you can scan a new person's documents.
+    </div>
+    <div style="display:flex;gap:8px;">
+      <button class="btn btn-danger" id="confirmClearBtn" style="flex:1;padding:8px;">🗑 Yes, Clear Profile</button>
+      <button class="btn btn-secondary" id="cancelClearBtn" style="padding:8px 14px;">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div style="text-align:center;padding:6px 0 10px;border-top:1px solid #1e1e2e">
+    <button class="btn btn-ghost" id="clearResultBtn">Clear</button>
+  </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
