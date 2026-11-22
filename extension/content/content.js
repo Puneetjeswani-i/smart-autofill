@@ -1,855 +1,689 @@
 /**
- * Smart Autofill Content Script — v4
+ * Smart Autofill — content script (v6)
  *
- * Key fixes over v3:
- * - getFieldContext now uses ONLY the direct label for the field (no container bleed)
- * - getVal fallbacks removed (birth_place no longer falls back to district/dob)
- * - nationality getVal no longer hardcodes 'Indian' when profile value is null
- * - gender excluded from nationality/percentage/birth_place matches
- * - Threshold raised to 0.70
- * - address field now matches 'current residential address' and similar
+ * On the Smart Autofill dashboard (localhost): receives the pairing key.
+ * On government portals: detects form fields, shows a PREVIEW of what will be
+ * filled for the active customer, fills only after the operator confirms,
+ * and lets the operator "teach" fields the heuristics do not recognise.
+ *
+ * It never clicks submit/pay buttons and never stores customer data.
  */
+(() => {
+  if (window.__smartAutofillLoaded) return;
+  window.__smartAutofillLoaded = true;
 
-// ── FIELD MAP ────────────────────────────────────────────────────────
-const FIELD_MAP = {
-  name: {
-    keywords: ['full name','fullname','applicant name','applicant_name',
-               'candidate name','your name','legal name','पूर्ण नाम','आवेदक का नाम',
-               'name as per aadhaar','name as on aadhaar'],
-    exclude:  ['father','mother','husband','school','college','institution','guardian',
-               'year','passing','percentage','grade','board','spouse','s/o','d/o','w/o',
-               'aadhaar','pan','voter','passport','driving','account'],
-    getVal: p => p.name,
-  },
-  father_name: {
-    keywords: ["father's name",'father name','पिता का नाम','पिता / पति का नाम',
-               's/o','son of','d/o','daughter of','पिता'],
-    exclude:  ['mother','husband','school','year','percentage','board'],
-    getVal: p => p.father_name,
-  },
-  mother_name: {
-    keywords: ["mother's name",'mother name','माता का नाम','माता'],
-    exclude:  ['father','husband','school','year','percentage','board'],
-    getVal: p => p.mother_name,
-  },
-  husband_name: {
-    keywords: ["husband's name",'husband name','w/o','wife of','spouse name','पति का नाम'],
-    exclude:  ['father','mother','school','year','percentage','board'],
-    getVal: p => p.husband_name,   // no fallback to father_name — only fill if actually married
-  },
-  dob: {
-    keywords: ['date of birth','dob','birth date','birthdate','जन्म तिथि','जन्म दिनांक'],
-    exclude:  ['year of passing','passing year','school','college','board','percentage','place'],
-    getVal: p => p.dob,
-  },
-  gender: {
-    keywords: ['gender','sex','लिंग'],
-    exclude:  ['nationality','percentage','grade','birth','place','school','year'],
-    getVal: p => p.gender,
-  },
-  phone: {
-    keywords: ['mobile number','phone number','mobile no','contact number','mob no',
-               'cell number','telephone','मोबाइल नंबर','मोबाइल'],
-    exclude:  [],
-    getVal: p => p.phone,
-  },
-  email: {
-    keywords: ['email address','email id','e-mail','emailid','ईमेल'],
-    exclude:  [],
-    getVal: p => p.email,
-  },
-  id_number: {
-    keywords: ['aadhaar number','aadhar number','uid number','aadhaar no','आधार नंबर','आधार संख्या'],
-    exclude:  ['name','father','mother','dob','birth'],
-    getVal: p => p.id_number,
-  },
-  pan: {
-    keywords: ['pan number','pan card number','permanent account number','पैन नंबर','pan card'],
-    exclude:  [],
-    getVal: p => p.pan,
-  },
-  voter_id: {
-    keywords: ['voter id','voter number','epic number','electoral id','मतदाता पहचान पत्र'],
-    exclude:  [],
-    getVal: p => p.voter_id,
-  },
-  driving_license: {
-    keywords: ['driving licence','driving license','dl number','dl no','licence number',
-               'ड्राइविंग लाइसेंस नंबर'],
-    exclude:  [],
-    getVal: p => p.driving_license,
-  },
-  passport_number: {
-    keywords: ['passport number','passport no','पासपोर्ट नंबर'],
-    exclude:  [],
-    getVal: p => p.passport_number,
-  },
-  address: {
-    keywords: ['current residential address','permanent address','current address',
-               'residential address','home address','full address',
-               'वर्तमान पता','स्थायी पता','आवासीय पता',
-               'house no street locality','house no. street'],
-    exclude:  ['pin','pincode','district','state','city','village','town'],
-    getVal: p => p.address,
-  },
-  pincode: {
-    keywords: ['pin code','pincode','postal code','zip code','पिन कोड','6-digit pin','6 digit pin'],
-    exclude:  [],
-    getVal: p => p.pincode,
-  },
-  district: {
-    keywords: ['district','distt','जिला'],
-    exclude:  ['school','college','year','percentage'],
-    getVal: p => p.district,
-  },
-  state: {
-    keywords: ['state','province','राज्य'],
-    exclude:  ['year','passing','percentage','school','college','nationality'],
-    getVal: p => p.state,
-  },
-  nationality: {
-    keywords: ['nationality','citizenship','राष्ट्रीयता'],
-    exclude:  ['gender','sex','percentage','grade','school','year','birth','place'],
-    getVal: p => p.nationality,
-  },
-  birth_place: {
-    keywords: ['place of birth','birth place','born at','जन्म स्थान','जन्म स्थल'],
-    exclude:  ['date','dob','year','percentage','gender','nationality'],
-    getVal: p => p.birth_place,   // no fallback — don't fill with wrong data
-  },
-  years_in_rajasthan: {
-    keywords: ['years in rajasthan','years residing in rajasthan','years residing',
-               'निवास वर्ष','rajasthan mein niwas'],
-    exclude:  [],
-    getVal: p => p.years_in_rajasthan,
-  },
+  const HAS_CHROME = typeof chrome !== 'undefined' && !!(chrome.runtime && chrome.runtime.id);
+  const IS_LOCAL = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
 
-  // ── Education ──────────────────────────────────────────────────────
-  education_10th_school: {
-    keywords: ['10th school','class x school','class 10 school','matriculation school',
-               'secondary school name','school name class x','school name class 10',
-               'school name matriculation','10वीं विद्यालय'],
-    exclude:  ['12th','xii','senior secondary','higher secondary','college','graduate',
-               'year of passing','percentage','grade','board'],
-    getVal: p => p.education_10th_school,
-  },
-  education_10th_board: {
-    keywords: ['10th board','class x board','class 10 board','matriculation board',
-               'board class 10','board class x'],
-    exclude:  ['12th','xii','school name','college','year','percentage'],
-    getVal: p => p.education_10th_board,
-  },
-  education_10th_year: {
-    keywords: ['10th year of passing','class x year of passing','year of passing class 10',
-               'matriculation year','passing year class x','year class 10'],
-    exclude:  ['12th','xii','school','college','percentage','board'],
-    getVal: p => p.education_10th_year,
-  },
-  education_10th_percentage: {
-    keywords: ['10th percentage','class x percentage','class x grade','marks class 10',
-               'percentage class x','grade class 10','matriculation percentage',
-               'percentage grade class x','percentage grade matriculation',
-               'percentage grade class x matriculation',
-               // Generic label + section context combinations
-               'percentage grade class x','percentage grade matriculation',
-               'percentage class x matriculation'],
-    exclude:  ['12th','xii','senior secondary','school','college','year','board','gender','nationality'],
-    getVal: p => p.education_10th_percentage,
-  },
-  education_12th_school: {
-    keywords: ['12th school','class xii school','class 12 school','senior secondary school',
-               'higher secondary school','school name class xii','school name class 12',
-               'school college name class xii','12वीं विद्यालय'],
-    exclude:  ['10th','class x','matriculation','graduate','year of passing',
-               'percentage','grade','board'],
-    getVal: p => p.education_12th_school,
-  },
-  education_12th_board: {
-    keywords: ['12th board','class xii board','class 12 board','senior secondary board',
-               'higher secondary board','board class xii','board class 12',
-               // Generic "board" label + section context
-               'board class xii senior','board senior secondary',
-               'board class 12 senior','board xii'],
-    exclude:  ['10th','class x','matriculation','school name','college','year','percentage'],
-    getVal: p => p.education_12th_board,
-  },
-  education_12th_year: {
-    keywords: ['12th year of passing','class xii year of passing','year of passing class 12',
-               'senior secondary year','passing year class xii','year class 12'],
-    exclude:  ['10th','class x','school','college','percentage','board'],
-    getVal: p => p.education_12th_year,
-  },
-  education_12th_percentage: {
-    keywords: ['12th percentage','class xii percentage','class xii grade',
-               'marks class 12','percentage class xii','grade class 12',
-               'senior secondary percentage','percentage grade class xii',
-               'percentage grade senior secondary',
-               // Generic label + section context combinations
-               'percentage grade class xii','percentage grade senior',
-               'percentage class xii senior','percentage class 12 senior',
-               // Just "percentage" or "grade" when section is class xii
-               'percentage class xii','percentage senior secondary',
-               'grade class xii','grade senior secondary'],
-    exclude:  ['10th','class x','matriculation','school','college','year','board','gender','nationality'],
-    getVal: p => p.education_12th_percentage,
-  },
-  education_grad_school: {
-    keywords: ['graduation college','graduate college','college name graduation',
-               'university name','degree college','स्नातक महाविद्यालय'],
-    exclude:  ['10th','12th','school','year of passing','percentage','board'],
-    getVal: p => p.education_grad_school,
-  },
-  highest_education: {
-    keywords: ['highest qualification','highest education','educational qualification',
-               'उच्चतम शैक्षिक योग्यता','highest academic qualification'],
-    exclude:  ['school','college','year','percentage','board'],
-    getVal: p => p.highest_education,
-  },
-};
-
-// ── HELPERS ──────────────────────────────────────────────────────────
-function extractPIN(address) {
-  const m = address && address.match(/\b(\d{6})\b/);
-  return m ? m[1] : null;
-}
-
-function normalize(str) {
-  return String(str || '').toLowerCase().replace(/[\s\-_\.\/\*]+/g, ' ').trim();
-}
-
-/**
- * Get the label text for a field — uses ONLY the direct label for that specific input.
- * Also checks the nearest section heading (fieldset legend / section title) for education context.
- */
-function getFieldLabel(el) {
-  // 1. aria-label (most reliable)
-  const ariaLabel = el.getAttribute('aria-label');
-  if (ariaLabel && ariaLabel.trim()) return normalize(ariaLabel);
-
-  // 2. label[for=id]
-  if (el.id) {
-    const linked = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-    if (linked) return normalize(linked.textContent);
-  }
-
-  // 3. Wrapping label
-  const parentLabel = el.closest('label');
-  if (parentLabel) {
-    const clone = parentLabel.cloneNode(true);
-    clone.querySelectorAll('input,select,textarea').forEach(e => e.remove());
-    const txt = normalize(clone.textContent);
-    if (txt.length > 2) return txt;
-  }
-
-  // 4. Immediately preceding sibling that looks like a label
-  let prev = el.previousElementSibling;
-  let steps = 0;
-  while (prev && steps < 3) {
-    const tag = prev.tagName.toLowerCase();
-    if (tag === 'label' || tag === 'span' || tag === 'p' || tag === 'div') {
-      const txt = normalize(prev.textContent);
-      if (txt.length > 2 && txt.length < 120) return txt;
-    }
-    prev = prev.previousElementSibling;
-    steps++;
-  }
-
-  // 5. name/id/placeholder as last resort
-  const fallback = el.placeholder || el.name || el.id || '';
-  return normalize(fallback);
-}
-
-/**
- * Get section context — looks for the nearest fieldset legend or section heading.
- * Used to disambiguate "Percentage / Grade" in Class X vs Class XII sections.
- * Also includes the element's own name/id attributes as hints.
- */
-function getSectionContext(el) {
-  // Include element's own name/id as context hints
-  const ownHints = normalize((el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('data-field') || ''));
-
-  let node = el.parentElement;
-  let depth = 0;
-  while (node && depth < 15) {
-    const tag = node.tagName?.toLowerCase();
-
-    // Check for fieldset legend
-    if (tag === 'fieldset') {
-      const legend = node.querySelector('legend');
-      if (legend) return ownHints + ' ' + normalize(legend.textContent);
-    }
-
-    // Check for heading elements directly inside this node
-    const heading = node.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > legend');
-    if (heading) {
-      const txt = normalize(heading.textContent);
-      if (txt.length > 2 && txt.length < 100) return ownHints + ' ' + txt;
-    }
-
-    // Check if this node itself is a heading
-    if (['h1','h2','h3','h4','h5','legend'].includes(tag)) {
-      const txt = normalize(node.textContent);
-      if (txt.length > 2 && txt.length < 100) return ownHints + ' ' + txt;
-    }
-
-    // Check for common section title class names
-    if (node.className && /section.title|card.title|panel.title|group.title|form.section/i.test(String(node.className))) {
-      const txt = normalize(node.textContent);
-      if (txt.length > 2 && txt.length < 100) return ownHints + ' ' + txt;
-    }
-
-    // Look for any element with class containing 'title' or 'heading' as first child
-    const titleEl = node.querySelector(':scope > [class*="title"], :scope > [class*="heading"]');
-    if (titleEl && titleEl !== el) {
-      const txt = normalize(titleEl.textContent);
-      if (txt.length > 2 && txt.length < 80) return ownHints + ' ' + txt;
-    }
-
-    node = node.parentElement;
-    depth++;
-  }
-  return ownHints;
-}
-
-/**
- * Get section context — looks for the nearest fieldset legend or section heading.
- * Used to disambiguate "Percentage / Grade" in Class X vs Class XII sections.
- */
-function getSectionContext(el) {
-  let node = el.parentElement;
-  let depth = 0;
-  while (node && depth < 15) {
-    const tag = node.tagName?.toLowerCase();
-
-    // Check for fieldset legend
-    if (tag === 'fieldset') {
-      const legend = node.querySelector('legend');
-      if (legend) return normalize(legend.textContent);
-    }
-
-    // Check for heading elements directly inside this node
-    const heading = node.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > legend');
-    if (heading) {
-      const txt = normalize(heading.textContent);
-      if (txt.length > 2 && txt.length < 100) return txt;
-    }
-
-    // Check if this node itself is a heading
-    if (['h1','h2','h3','h4','h5','legend'].includes(tag)) {
-      const txt = normalize(node.textContent);
-      if (txt.length > 2 && txt.length < 100) return txt;
-    }
-
-    // Check for common section title class names
-    if (node.className && /section.title|card.title|panel.title|group.title|form.section/i.test(node.className)) {
-      const txt = normalize(node.textContent);
-      if (txt.length > 2 && txt.length < 100) return txt;
-    }
-
-    // Look for any element with class containing 'title' or 'heading' as first child
-    const titleEl = node.querySelector(':scope > [class*="title"], :scope > [class*="heading"], :scope > [class*="label"]');
-    if (titleEl && titleEl !== el) {
-      const txt = normalize(titleEl.textContent);
-      if (txt.length > 2 && txt.length < 80) return txt;
-    }
-
-    node = node.parentElement;
-    depth++;
-  }
-  return '';
-}
-
-function matchScore(label, keywords, exclude) {
-  if (!label || label.length < 2) return 0;
-
-  // Exclusion check — if any exclusion word appears in the label, reject
-  if (exclude && exclude.length > 0) {
-    for (const ex of exclude) {
-      if (label.includes(normalize(ex))) return 0;
-    }
-  }
-
-  let best = 0;
-  for (const kw of keywords) {
-    const nkw = normalize(kw);
-    if (label === nkw) { best = 1.0; break; }
-    if (label.includes(nkw)) {
-      // Phrase found in label — score based on how much of the label it covers
-      const coverage = nkw.length / label.length;
-      best = Math.max(best, Math.min(0.95, 0.75 + coverage * 0.2));
-    } else {
-      // Word-level overlap (only meaningful words, length > 2)
-      const kwWords = nkw.split(' ').filter(w => w.length > 2);
-      if (kwWords.length === 0) continue;
-      const labelWords = label.split(' ');
-      const overlap = kwWords.filter(w =>
-        labelWords.some(c => c === w || (c.length > 3 && (c.startsWith(w) || w.startsWith(c))))
-      ).length;
-      if (overlap > 0) {
-        const ratio = overlap / kwWords.length;
-        // Only give partial credit if majority of keyword words match
-        if (ratio >= 0.5) best = Math.max(best, 0.55 + ratio * 0.2);
-      }
-    }
-  }
-  return best;
-}
-
-function detectField(el) {
-  const label = getFieldLabel(el);
-  if (!label || label.length < 2) return null;
-
-  // Build combined context: label + section heading + element name/id hints
-  const section = getSectionContext(el);
-  const combinedContext = section ? `${label} ${section}` : label;
-
-  // Debug: log what we're working with
-  console.log(`[AutoFill v4] Detecting: label="${label}" section="${section.substring(0,60)}" combined="${combinedContext.substring(0,80)}"`);
-
-  let bestField = null, bestScore = 0;
-  for (const [key, cfg] of Object.entries(FIELD_MAP)) {
-    // Try combined context
-    let score = matchScore(combinedContext, cfg.keywords, cfg.exclude);
-    // Also try label alone
-    const labelScore = matchScore(label, cfg.keywords, cfg.exclude);
-    score = Math.max(score, labelScore);
-    if (score > bestScore) { bestScore = score; bestField = key; }
-  }
-
-  // ── Position-based fallback for generic education labels ──────────
-  // If label is "percentage / grade" or "board" and section contains class level info
-  if (bestScore < 0.70) {
-    const lbl = label.replace(/[^a-z0-9 ]/g, '').trim();
-    const sec = section.toLowerCase();
-    const isXII = /xii|12|senior secondary|higher secondary/i.test(sec);
-    const isX   = /\bx\b|class 10|matriculation|secondary(?!.*senior)/i.test(sec);
-
-    if (/^percentage/.test(lbl) || /^grade/.test(lbl) || lbl === 'percentage grade') {
-      if (isXII) { bestField = 'education_12th_percentage'; bestScore = 0.80; }
-      else if (isX) { bestField = 'education_10th_percentage'; bestScore = 0.80; }
-    }
-    if (/^board$/.test(lbl) || lbl === 'board of examination' || lbl === 'select board') {
-      if (isXII) { bestField = 'education_12th_board'; bestScore = 0.80; }
-      else if (isX) { bestField = 'education_10th_board'; bestScore = 0.80; }
-    }
-    if (/^school/.test(lbl) || /school college name/.test(lbl)) {
-      if (isXII) { bestField = 'education_12th_school'; bestScore = 0.80; }
-      else if (isX) { bestField = 'education_10th_school'; bestScore = 0.80; }
-    }
-    if (/year of passing/.test(lbl) || /^year$/.test(lbl)) {
-      if (isXII) { bestField = 'education_12th_year'; bestScore = 0.80; }
-      else if (isX) { bestField = 'education_10th_year'; bestScore = 0.80; }
-    }
-  }
-
-  if (bestScore >= 0.70) {
-    console.log(`[AutoFill v4] Matched: "${label}" → ${bestField} (${Math.round(bestScore*100)}%)`);
-  } else {
-    console.log(`[AutoFill v4] No match for: "${label}" (best=${Math.round(bestScore*100)}% as ${bestField})`);
-  }
-
-  return bestScore >= 0.70 ? { field: bestField, score: bestScore } : null;
-}
-
-function fillInput(el, value) {
-  if (value === null || value === undefined || value === '') return false;
-  const str = String(value);
-  if (el.tagName === 'SELECT') {
-    const lv = str.toLowerCase().trim();
-    // Try exact match first
-    let opt = Array.from(el.options).find(o =>
-      o.value.toLowerCase() === lv || o.text.toLowerCase() === lv
-    );
-    // Try contains match
-    if (!opt) opt = Array.from(el.options).find(o =>
-      o.text.toLowerCase().includes(lv) || lv.includes(o.text.toLowerCase().trim())
-    );
-    // For board fields: try keyword matching (CBSE, ICSE, UP Board, etc.)
-    if (!opt) {
-      const boardKeywords = extractBoardKeywords(lv);
-      opt = Array.from(el.options).find(o => {
-        const ot = o.text.toLowerCase();
-        return boardKeywords.some(kw => ot.includes(kw));
+  // ── 1. Pairing with the dashboard ─────────────────────────────────────────
+  if (IS_LOCAL && HAS_CHROME) {
+    window.addEventListener('message', (e) => {
+      if (e.source !== window || e.origin !== location.origin) return;
+      const d = e.data || {};
+      if (d.type !== 'SMART_AUTOFILL_PAIR' || !d.key) return;
+      chrome.runtime.sendMessage({ action: 'pair', key: d.key, backend: d.backend || location.origin }, (r) => {
+        if (r && r.ok) window.postMessage({ type: 'SMART_AUTOFILL_PAIRED', version: '6.0.0' }, location.origin);
       });
-    }
-    if (opt) { el.value = opt.value; triggerEvents(el); return true; }
-    return false;
-  }
-  const nativeSetter = el.tagName === 'TEXTAREA'
-    ? Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
-    : Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-  if (nativeSetter) nativeSetter.call(el, str);
-  else el.value = str;
-  triggerEvents(el);
-  return true;
-}
-
-/**
- * Extract meaningful keywords from a board name for fuzzy select matching.
- * e.g. "Uttar Pradesh Board Of High School And Intermediate Education"
- *   → ['uttar pradesh', 'up board', 'upmsp']
- */
-function extractBoardKeywords(boardName) {
-  const kws = [boardName];
-  if (/uttar\s*pradesh/i.test(boardName)) kws.push('uttar pradesh', 'up board', 'upmsp', 'u.p');
-  if (/cbse/i.test(boardName)) kws.push('cbse', 'central board');
-  if (/icse|cisce/i.test(boardName)) kws.push('icse', 'cisce');
-  if (/rajasthan/i.test(boardName)) kws.push('rajasthan', 'rbse', 'bser');
-  if (/maharashtra/i.test(boardName)) kws.push('maharashtra', 'msbshse');
-  if (/bihar/i.test(boardName)) kws.push('bihar', 'bseb');
-  if (/madhya\s*pradesh/i.test(boardName)) kws.push('madhya pradesh', 'mpbse');
-  if (/gujarat/i.test(boardName)) kws.push('gujarat', 'gseb');
-  if (/karnataka/i.test(boardName)) kws.push('karnataka', 'kseeb');
-  if (/tamil\s*nadu/i.test(boardName)) kws.push('tamil nadu', 'tnbse');
-  if (/west\s*bengal/i.test(boardName)) kws.push('west bengal', 'wbbse');
-  return kws;
-}
-
-function triggerEvents(el) {
-  ['input', 'change', 'blur', 'keyup'].forEach(t =>
-    el.dispatchEvent(new Event(t, { bubbles: true }))
-  );
-}
-
-function highlightField(el, score) {
-  const color = score >= 0.85 ? '34, 197, 94' : score >= 0.70 ? '234, 179, 8' : '99, 102, 241';
-  el.style.transition = 'box-shadow 0.3s ease, border-color 0.3s ease';
-  el.style.boxShadow = `0 0 0 2px rgba(${color}, 0.5)`;
-  el.style.outline = `2px solid rgba(${color}, 0.8)`;
-  setTimeout(() => { el.style.boxShadow = ''; el.style.outline = ''; }, 3000);
-}
-
-function getInputs() {
-  return Array.from(document.querySelectorAll(
-    'input:not([type="hidden"]):not([type="submit"]):not([type="button"])' +
-    ':not([type="image"]):not([type="file"]):not([type="checkbox"]):not([type="radio"]),' +
-    'textarea, select'
-  )).filter(el => {
-    const s = window.getComputedStyle(el);
-    return s.display !== 'none' && s.visibility !== 'hidden' && !el.disabled && !el.readOnly;
-  });
-}
-
-// ── PREVIEW OVERLAY ──────────────────────────────────────────────────
-let overlayEl = null;
-
-function showConsentOverlay(mappings, profile, onConfirm, onCancel) {
-  removeOverlay();
-  overlayEl = document.createElement('div');
-  overlayEl.id = '__autofill_overlay__';
-  overlayEl.style.cssText = `
-    position:fixed;top:20px;right:20px;z-index:2147483647;
-    width:340px;max-height:80vh;overflow-y:auto;
-    background:#1e1e2e;color:#cdd6f4;border-radius:16px;
-    box-shadow:0 20px 60px rgba(0,0,0,0.6);border:1px solid #313244;
-    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;
-  `;
-  const highConf = mappings.filter(m => m.score >= 0.85).length;
-  const medConf  = mappings.filter(m => m.score >= 0.70 && m.score < 0.85).length;
-
-  overlayEl.innerHTML = `
-    <div style="padding:16px 20px;border-bottom:1px solid #313244;display:flex;align-items:center;gap:10px">
-      <div style="font-size:22px">⚡</div>
-      <div>
-        <div style="font-weight:700;font-size:15px;color:#cba6f7">Smart Autofill</div>
-        <div style="font-size:11px;color:#6c7086">${mappings.length} field${mappings.length !== 1 ? 's' : ''} detected on this page</div>
-      </div>
-      <button id="__af_close__" style="margin-left:auto;background:none;border:none;color:#6c7086;cursor:pointer;font-size:18px;line-height:1">×</button>
-    </div>
-    <div style="padding:12px 16px;display:flex;gap:8px;flex-wrap:wrap">
-      ${highConf ? `<span style="background:#1e3a1e;color:#a6e3a1;padding:3px 8px;border-radius:20px;font-size:11px">✓ ${highConf} high confidence</span>` : ''}
-      ${medConf  ? `<span style="background:#3a2e1e;color:#f9e2af;padding:3px 8px;border-radius:20px;font-size:11px">⚠ ${medConf} medium confidence</span>` : ''}
-    </div>
-    <div style="padding:0 12px;max-height:320px;overflow-y:auto">
-      ${mappings.map((m, i) => {
-        const confColor = m.score >= 0.85 ? '#a6e3a1' : '#f9e2af';
-        const confLabel = m.score >= 0.85 ? 'High' : 'Med';
-        return `
-          <div style="margin:6px 0;background:#181825;border-radius:10px;padding:10px 12px;border:1px solid #313244">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-              <div style="color:#89b4fa;font-size:11px;font-weight:600;text-transform:uppercase">${m.field.replace(/_/g,' ')}</div>
-              <div style="font-size:10px;color:${confColor};background:${confColor}22;padding:2px 6px;border-radius:10px">${confLabel} ${Math.round(m.score*100)}%</div>
-            </div>
-            <input id="__af_val_${i}__" value="${escHtml(String(m.value || ''))}"
-              style="width:100%;background:#11111b;border:1px solid #45475a;border-radius:6px;padding:6px 8px;color:#cdd6f4;font-size:12px;box-sizing:border-box"/>
-            <div style="font-size:10px;color:#6c7086;margin-top:4px">→ ${escHtml(m.label)}</div>
-          </div>`;
-      }).join('')}
-    </div>
-    <div style="padding:14px 16px;display:flex;gap:8px;border-top:1px solid #313244">
-      <button id="__af_confirm__" style="flex:1;background:#6c5ce7;color:#fff;border:none;border-radius:8px;padding:9px 0;cursor:pointer;font-weight:600;font-size:13px">
-        ⚡ Fill ${mappings.length} Fields
-      </button>
-      <button id="__af_cancel__" style="background:#313244;color:#cdd6f4;border:none;border-radius:8px;padding:9px 14px;cursor:pointer;font-size:13px">Cancel</button>
-    </div>
-  `;
-  document.body.appendChild(overlayEl);
-
-  document.getElementById('__af_close__')?.addEventListener('click', () => { removeOverlay(); onCancel(); });
-  document.getElementById('__af_cancel__')?.addEventListener('click', () => { removeOverlay(); onCancel(); });
-  document.getElementById('__af_confirm__')?.addEventListener('click', () => {
-    const editedMappings = mappings.map((m, i) => ({
-      ...m,
-      value: document.getElementById(`__af_val_${i}__`)?.value ?? m.value,
-    }));
-    removeOverlay();
-    onConfirm(editedMappings);
-  });
-}
-
-function removeOverlay() {
-  if (overlayEl) { overlayEl.remove(); overlayEl = null; }
-}
-
-function escHtml(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// ── SCAN FIELDS ──────────────────────────────────────────────────────
-function scanFields() {
-  return getInputs().map(el => {
-    const match = detectField(el);
-    const label = el.getAttribute('aria-label')
-      || document.querySelector(`label[for="${el.id}"]`)?.textContent?.trim()
-      || el.placeholder || el.name || el.id || 'unnamed';
-    return { el, label, matched: match?.field || null, score: match?.score || 0 };
-  }).filter(f => f.matched);
-}
-
-// ── AUTOFILL ─────────────────────────────────────────────────────────
-function buildMappings(profile) {
-  return scanFields().map(f => ({
-    el: f.el,
-    field: f.matched,
-    label: f.label,
-    score: f.score,
-    value: FIELD_MAP[f.matched]?.getVal(profile) || null,
-  })).filter(m => m.value !== null && m.value !== undefined && m.value !== '');
-}
-
-function executeAutofill(mappings) {
-  let filled = 0;
-  for (const m of mappings) {
-    if (fillInput(m.el, m.value)) {
-      highlightField(m.el, m.score);
-      filled++;
-      console.log(`[AutoFill v4] ✓ "${m.label}" → ${m.field} = "${m.value}" (${Math.round(m.score * 100)}%)`);
-    }
-  }
-  return { filled, total: mappings.length };
-}
-
-// ── MESSAGE LISTENER ─────────────────────────────────────────────────
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-
-  if (message.action === 'scanFields') {
-    const fields = scanFields().map(f => ({
-      name: f.label, tag: f.el.tagName, type: f.el.type || '',
-      matched: f.matched, score: f.score,
-    }));
-    sendResponse({ fields });
-  }
-
-  if (message.action === 'doAutofill') {
-    const profile = message.profile;
-    if (!profile) return sendResponse({ filled: 0, total: 0 });
-    const mappings = buildMappings(profile);
-    if (mappings.length === 0) return sendResponse({ filled: 0, total: 0 });
-
-    if (message.showPreview) {
-      showConsentOverlay(
-        mappings, profile,
-        (editedMappings) => {
-          const result = executeAutofill(editedMappings);
-          chrome.runtime.sendMessage({ action: 'autofillComplete', result });
-        },
-        () => chrome.runtime.sendMessage({ action: 'autofillCancelled' })
-      );
-      sendResponse({ preview: true, fields_detected: mappings.length });
-    } else {
-      sendResponse(executeAutofill(mappings));
-    }
-  }
-
-  if (message.action === 'removeOverlay') {
-    removeOverlay();
-    sendResponse({ ok: true });
-  }
-
-  // ── Portal autofill triggered by background.js ──────────────────
-  if (message.action === 'doPortalAutofill') {
-    const { schemeId, profileData } = message;
-    const result = runPortalAutofill(schemeId, profileData);
-    // Clear pending after filling
-    if (window.chrome?.storage?.local) {
-      chrome.storage.local.remove('pendingAutofill');
-    }
-    sendResponse({ filled: result.filled, total: result.total });
-  }
-
-  return true;
-});
-
-// ── Listen for postMessage from the dashboard (same tab) ─────────────
-window.addEventListener('message', (event) => {
-  if (event.data?.type !== 'SMART_AUTOFILL_APPLY') return;
-  const { schemeId, profileData } = event.data;
-  if (!schemeId || !profileData) return;
-
-  // Store in chrome.storage.local so background.js can trigger on the new tab
-  if (window.chrome?.storage?.local) {
-    chrome.storage.local.set({
-      pendingAutofill: { schemeId, profileData, timestamp: Date.now() },
     });
+    return; // no autofill UI on the dashboard itself
   }
-});
 
-// ── Portal field maps ─────────────────────────────────────────────────
-const PORTAL_FIELD_MAPS = {
-  // eMitra (mool_niwas, income_certificate, caste_certificate)
-  emitra: {
-    name:        ['#applicantName','[name="applicantName"]','[placeholder*="Name"]','[placeholder*="नाम"]'],
-    father_name: ['#fatherName','[name="fatherName"]','[placeholder*="Father"]','[placeholder*="पिता"]'],
-    dob:         ['#dob','[name="dob"]','[placeholder*="Birth"]','[placeholder*="जन्म"]'],
-    id_number:   ['#aadhaarNo','[name="aadhaarNo"]','[placeholder*="Aadhaar"]','[placeholder*="आधार"]'],
-    address:     ['#address','[name="address"]','[placeholder*="Address"]','[placeholder*="पता"]'],
-    district:    ['#district','[name="district"]','[placeholder*="District"]','[placeholder*="जिला"]'],
-    pincode:     ['#pincode','[name="pincode"]','[placeholder*="PIN"]','[placeholder*="पिन"]'],
-    phone:       ['#mobileNo','[name="mobileNo"]','[placeholder*="Mobile"]','[placeholder*="मोबाइल"]'],
-  },
-  // Scholarship portal
-  scholarship: {
-    name:                      ['#studentName','[name="studentName"]','[placeholder*="Student Name"]'],
-    dob:                       ['#dob','[name="dob"]','[placeholder*="Date of Birth"]'],
-    id_number:                 ['#aadhaarNo','[name="aadhaarNo"]','[placeholder*="Aadhaar"]'],
-    father_name:               ['#fatherName','[name="fatherName"]','[placeholder*="Father"]'],
-    address:                   ['#address','[name="address"]','[placeholder*="Address"]'],
-    pincode:                   ['#pincode','[name="pincode"]','[placeholder*="PIN"]'],
-    education_12th_school:     ['#schoolName','[name="schoolName"]','[placeholder*="School"]'],
-    education_12th_board:      ['#boardName','[name="boardName"]','[placeholder*="Board"]'],
-    education_12th_percentage: ['#percentage','[name="percentage"]','[placeholder*="Percentage"]'],
-  },
-  // ECI Voter portal
-  voters: {
-    name:     ['#applicantName','[name="applicantName"]','[placeholder*="Name"]'],
-    dob:      ['#dob','[name="dob"]','[placeholder*="Birth"]'],
-    gender:   ['#gender','[name="gender"]','[placeholder*="Gender"]'],
-    phone:    ['#mobileNo','[name="mobileNo"]','[placeholder*="Mobile"]'],
-    email:    ['#emailId','[name="emailId"]','[placeholder*="Email"]'],
-    address:  ['#houseNo','[name="houseNo"]','[placeholder*="House"]'],
-    pincode:  ['#pinCode','[name="pinCode"]','[placeholder*="PIN"]'],
-  },
-  // Sarathi DL portal
-  sarathi: {
-    name:        ['#appName','[name="appName"]','[placeholder*="Name"]'],
-    dob:         ['#appDob','[name="appDob"]','[placeholder*="Birth"]'],
-    gender:      ['#appGender','[name="appGender"]'],
-    phone:       ['#appMobile','[name="appMobile"]','[placeholder*="Mobile"]'],
-    blood_group: ['#appBloodGroup','[name="appBloodGroup"]'],
-    address:     ['#appAddress','[name="appAddress"]','[placeholder*="Address"]'],
-    pincode:     ['#appPincode','[name="appPincode"]','[placeholder*="PIN"]'],
-  },
-  // PM-KISAN
-  pmkisan: {
-    id_number:   ['#aadhaarNo','[name="aadhaarNo"]','[placeholder*="Aadhaar"]'],
-    name:        ['#farmerName','[name="farmerName"]','[placeholder*="Name"]'],
-    father_name: ['#fatherName','[name="fatherName"]','[placeholder*="Father"]'],
-    address:     ['#address','[name="address"]','[placeholder*="Address"]'],
-    district:    ['#districtName','[name="districtName"]','[placeholder*="District"]'],
-    state:       ['#stateName','[name="stateName"]','[placeholder*="State"]'],
-    pincode:     ['#pinCode','[name="pinCode"]','[placeholder*="PIN"]'],
-    phone:       ['#mobileNo','[name="mobileNo"]','[placeholder*="Mobile"]'],
-  },
-  // Ayushman Bharat
-  ayushman: {
-    id_number: ['#aadhaarNo','[name="aadhaarNo"]','[placeholder*="Aadhaar"]'],
-    phone:     ['#mobileNo','[name="mobileNo"]','[placeholder*="Mobile"]'],
-    name:      ['#name','[name="name"]','[placeholder*="Name"]'],
-  },
-  // NSP Scholarship
-  nsp: {
-    name:           ['#studentName','[name="studentName"]','[placeholder*="Name"]'],
-    dob:            ['#dob','[name="dob"]','[placeholder*="Birth"]'],
-    phone:          ['#mobileNo','[name="mobileNo"]','[placeholder*="Mobile"]'],
-    email:          ['#emailId','[name="emailId"]','[placeholder*="Email"]'],
-    id_number:      ['#aadhaarNo','[name="aadhaarNo"]','[placeholder*="Aadhaar"]'],
-    account_number: ['#bankAccountNo','[name="bankAccountNo"]','[placeholder*="Account"]'],
-    ifsc_code:      ['#ifscCode','[name="ifscCode"]','[placeholder*="IFSC"]'],
-  },
-  // Rajasthan Sambal / LDMS
-  ldms: {
-    name:        ['#workerName','[name="workerName"]','[placeholder*="Name"]'],
-    father_name: ['#fatherName','[name="fatherName"]','[placeholder*="Father"]'],
-    dob:         ['#dob','[name="dob"]','[placeholder*="Birth"]'],
-    id_number:   ['#aadhaarNo','[name="aadhaarNo"]','[placeholder*="Aadhaar"]'],
-    phone:       ['#mobileNo','[name="mobileNo"]','[placeholder*="Mobile"]'],
-    address:     ['#address','[name="address"]','[placeholder*="Address"]'],
-    district:    ['#district','[name="district"]','[placeholder*="District"]'],
-    pincode:     ['#pincode','[name="pincode"]','[placeholder*="PIN"]'],
-  },
-};
+  // ── 2. Field vocabulary ───────────────────────────────────────────────────
+  const F = (keywords, exclude = [], extra = {}) => ({ keywords, exclude, ...extra });
+  const NAME_EXCL = ['father', 'mother', 'husband', 'spouse', 'guardian', 'school', 'college', 'bank', 'branch', 'institute', 'village', 'district', 'user', 'login', 'first', 'last', 'middle', 'nominee', 'पिता', 'माता', 'पति', 'hindi', 'हिंदी', 'हिन्दी'];
+  const FIELD_MAP = {
+    name: F(['applicant name', 'full name', 'name of applicant', 'candidate name', 'student name', 'name as per aadhaar', 'name as in aadhaar', 'your name', 'name english', 'name in english', 'आवेदक का नाम', 'प्रार्थी का नाम', 'पूरा नाम', 'नाम अंग्रेजी', 'नाम'], NAME_EXCL),
+    name_hi: F(['name in hindi', 'name hindi', 'applicant name in hindi', 'नाम हिंदी', 'हिंदी में नाम', 'आवेदक का नाम हिंदी', 'नाम हिन्दी'], ['father', 'mother', 'husband', 'पिता', 'माता', 'पति']),
+    first_name: F(['first name', 'given name', 'प्रथम नाम', 'पहला नाम'], ['father', 'mother', 'husband']),
+    middle_name: F(['middle name', 'मध्य नाम'], ['father', 'mother']),
+    last_name: F(['last name', 'surname', 'family name', 'उपनाम'], ['father', 'mother']),
+    father_name: F(["father's name", 'father name', 'fathers name', 'name of father', 'पिता का नाम'], ['mother', 'husband', 'hindi', 'हिंदी', 'हिन्दी', 'occupation', 'व्यवसाय', 'पति']),
+    father_name_hi: F(['father name in hindi', 'father name hindi', 'पिता का नाम हिंदी', 'पिता का नाम हिन्दी'], ['mother']),
+    father_or_husband_name: F(['father husband', 'father or husband', 'पिता पति', 'पिता / पति'], ['hindi', 'हिंदी']),
+    mother_name: F(["mother's name", 'mother name', 'name of mother', 'माता का नाम'], ['father', 'husband']),
+    husband_name: F(["husband's name", 'husband name', 'spouse name', 'पति का नाम'], ['father', 'mother']),
+    dob: F(['date of birth', 'dob', 'birth date', 'जन्म तिथि', 'जन्म दिनांक', 'जन्मतिथि'], ['place', 'स्थान', 'certificate']),
+    age: F(['age', 'आयु', 'उम्र'], [], { word: true }),
+    gender: F(['gender', 'sex', 'लिंग'], [], { word: true }),
+    is_married: F(['marital status', 'married', 'वैवाहिक स्थिति', 'विवाहित'], []),
+    religion: F(['religion', 'धर्म'], [], { word: true }),
+    caste_category: F(['caste category', 'social category', 'category', 'वर्ग', 'श्रेणी'], ['service', 'document', 'vehicle', 'certificate type', 'product', 'scheme']),
+    caste: F(['caste', 'जाति'], ['category', 'certificate', 'वर्ग']),
+    annual_income: F(['annual income', 'family income', 'yearly income', 'income', 'वार्षिक आय', 'पारिवारिक आय', 'आय'], ['tax', 'certificate no']),
+    occupation: F(['occupation', 'profession', 'व्यवसाय', 'पेशा'], ['father', 'पिता']),
+    father_occupation: F(["father's occupation", 'father occupation', 'पिता का व्यवसाय'], []),
+    phone: F(['mobile number', 'mobile no', 'mobile', 'phone number', 'contact number', 'contact no', 'मोबाइल नंबर', 'मोबाइल'], ['otp', 'verify']),
+    email: F(['email', 'e mail', 'email id', 'ईमेल'], []),
+    id_number: F(['aadhaar number', 'aadhar number', 'aadhaar no', 'aadhar no', 'uid number', 'uid no', 'aadhaar', 'आधार नंबर', 'आधार संख्या', 'आधार क्रमांक', 'आधार'], ['enrol', 'vid', 'virtual', 'jan', 'जन']),
+    jan_aadhaar_id: F(['jan aadhaar', 'janaadhaar', 'bhamashah', 'जन आधार'], []),
+    pan: F(['pan number', 'pan no', 'pan card', 'permanent account number', 'पैन'], ['panchayat', 'company']),
+    voter_id: F(['voter id', 'epic', 'electoral', 'मतदाता पहचान', 'वोटर'], []),
+    driving_license: F(['driving licence', 'driving license', 'dl number', 'dl no', 'ड्राइविंग लाइसेंस'], []),
+    passport_number: F(['passport number', 'passport no', 'पासपोर्ट'], []),
+    ration_card_number: F(['ration card', 'राशन कार्ड'], []),
+    address: F(['address', 'full address', 'permanent address', 'current address', 'residential address', 'correspondence address', 'पता', 'स्थायी पता', 'वर्तमान पता'], ['email', 'e mail', 'ip address', 'web', 'office', 'work', 'line 2', 'hindi', 'हिंदी', 'pin', 'district', 'state', 'occupation']),
+    address_hi: F(['address in hindi', 'address hindi', 'पता हिंदी', 'पता हिन्दी'], []),
+    house_no: F(['house no', 'house number', 'plot no', 'flat no', 'मकान नं', 'मकान संख्या'], ['owner', 'tax']),
+    street: F(['street', 'locality', 'mohalla', 'colony', 'road', 'गली', 'मोहल्ला'], []),
+    village_city: F(['village', 'city', 'town', 'vtc', 'gram', 'गाँव', 'ग्राम', 'शहर', 'कस्बा'], ['district', 'tehsil', 'panchayat']),
+    post_office: F(['post office', 'डाकघर'], ['code', 'pin', 'postal code']),
+    tehsil: F(['tehsil', 'tahsil', 'sub district', 'तहसील'], []),
+    district: F(['district', 'distt', 'जिला', 'ज़िला'], ['sub district']),
+    state: F(['state', 'राज्य'], ['statement', 'status'], { word: true }),
+    pincode: F(['pin code', 'pincode', 'postal code', 'zip', 'पिन कोड', 'पिनकोड'], []),
+    birth_place: F(['place of birth', 'birth place', 'जन्म स्थान'], []),
+    native_place: F(['native place', 'मूल स्थान'], []),
+    years_in_rajasthan: F(['years in rajasthan', 'years of residence', 'residing since', 'कितने वर्षों', 'निवास की अवधि'], []),
+    nationality: F(['nationality', 'राष्ट्रीयता'], []),
+    blood_group: F(['blood group', 'रक्त समूह'], []),
+    account_number: F(['account number', 'account no', 'a c no', 'bank account', 'खाता संख्या', 'खाता नंबर'], ['ifsc']),
+    ifsc_code: F(['ifsc', 'ifsc code'], []),
+    bank_name: F(['bank name', 'name of bank', 'बैंक का नाम'], ['branch']),
+    education_10th_school: F(['10th school', 'class x school', 'class 10 school', 'secondary school name', '10वीं विद्यालय'], ['12th', 'xii', 'senior', 'year', 'percentage', 'board']),
+    education_10th_board: F(['10th board', 'class x board', 'class 10 board', 'matriculation board'], ['12th', 'xii', 'school name', 'year', 'percentage']),
+    education_10th_year: F(['10th year of passing', 'class x year of passing', 'class 10 passing year', 'matriculation year'], ['12th', 'xii', 'percentage', 'board']),
+    education_10th_percentage: F(['10th percentage', 'class x percentage', 'class 10 percentage', 'matriculation percentage'], ['12th', 'xii', 'year', 'board']),
+    education_12th_school: F(['12th school', 'class xii school', 'class 12 school', 'senior secondary school', '12वीं विद्यालय'], ['10th', 'class x ', 'year', 'percentage', 'board']),
+    education_12th_board: F(['12th board', 'class xii board', 'class 12 board', 'senior secondary board'], ['10th', 'school name', 'year', 'percentage']),
+    education_12th_year: F(['12th year of passing', 'class xii year of passing', 'class 12 passing year'], ['10th', 'percentage', 'board']),
+    education_12th_percentage: F(['12th percentage', 'class xii percentage', 'class 12 percentage', 'senior secondary percentage'], ['10th', 'year', 'board']),
+    education_grad_school: F(['graduation college', 'college name', 'university name', 'स्नातक महाविद्यालय'], ['10th', '12th', 'school', 'year', 'percentage']),
+    highest_education: F(['highest qualification', 'educational qualification', 'education qualification', 'शैक्षिक योग्यता'], ['school', 'college', 'year']),
+  };
+  const HINDI_VARIANT = { name: 'name_hi', father_name: 'father_name_hi', address: 'address_hi' };
 
-// Map scheme IDs to portal field maps
-const SCHEME_TO_PORTAL = {
-  mool_niwas:         'emitra',
-  income_certificate: 'emitra',
-  caste_certificate:  'emitra',
-  scholarship:        'scholarship',
-  voter_registration: 'voters',
-  driving_license:    'sarathi',
-  pm_kisan:           'pmkisan',
-  ayushman_bharat:    'ayushman',
-  nsp_scholarship:    'nsp',
-  rajasthan_sambal:   'ldms',
-};
+  const DISTRICT_HI = {
+    ajmer: 'अजमेर', alwar: 'अलवर', balotra: 'बालोतरा', banswara: 'बांसवाड़ा', baran: 'बारां', barmer: 'बाड़मेर', beawar: 'ब्यावर',
+    bharatpur: 'भरतपुर', bhilwara: 'भीलवाड़ा', bikaner: 'बीकानेर', bundi: 'बूंदी', chittorgarh: 'चित्तौड़गढ़', churu: 'चूरू', dausa: 'दौसा',
+    deeg: 'डीग', dholpur: 'धौलपुर', 'didwana-kuchaman': 'डीडवाना-कुचामन', dungarpur: 'डूंगरपुर', hanumangarh: 'हनुमानगढ़', jaipur: 'जयपुर',
+    jaisalmer: 'जैसलमेर', jalore: 'जालोर', jhalawar: 'झालावाड़', jhunjhunu: 'झुंझुनूं', jodhpur: 'जोधपुर', karauli: 'करौली',
+    'khairthal-tijara': 'खैरथल-तिजारा', kota: 'कोटा', 'kotputli-behror': 'कोटपूतली-बहरोड़', nagaur: 'नागौर', pali: 'पाली', phalodi: 'फलोदी',
+    pratapgarh: 'प्रतापगढ़', rajsamand: 'राजसमंद', salumbar: 'सलूम्बर', 'sawai madhopur': 'सवाई माधोपुर', sikar: 'सीकर', sirohi: 'सिरोही',
+    'sri ganganagar': 'श्रीगंगानगर', ganganagar: 'श्रीगंगानगर', tonk: 'टोंक', udaipur: 'उदयपुर',
+  };
 
-/**
- * Fill a portal form using the scheme's field map and profile data.
- * Tries multiple selectors per field, uses the first that finds an element.
- */
-function runPortalAutofill(schemeId, profileData) {
-  const portalKey = SCHEME_TO_PORTAL[schemeId];
-  const fieldMap  = PORTAL_FIELD_MAPS[portalKey];
-  if (!fieldMap || !profileData) return { filled: 0, total: 0 };
+  const SYNONYMS = {
+    gender: {
+      male: ['male', 'm', 'पुरुष', 'purush', 'man'],
+      female: ['female', 'f', 'महिला', 'स्त्री', 'woman', 'mahila'],
+      transgender: ['transgender', 'third gender', 'other', 't', 'tg', 'ट्रांसजेंडर', 'अन्य', 'उभयलिंगी'],
+    },
+    yesno: { yes: ['yes', 'y', 'हाँ', 'हां', 'haan', 'married', 'विवाहित'], no: ['no', 'n', 'नहीं', 'nahi', 'unmarried', 'single', 'अविवाहित'] },
+    caste_category: {
+      general: ['general', 'gen', 'सामान्य', 'ur', 'unreserved', 'open'],
+      obc: ['obc', 'other backward class', 'अन्य पिछड़ा वर्ग', 'पिछड़ा वर्ग'],
+      mbc: ['mbc', 'most backward class', 'अति पिछड़ा वर्ग', 'विशेष पिछड़ा वर्ग', 'sbc'],
+      sc: ['sc', 'scheduled caste', 'अनुसूचित जाति'],
+      st: ['st', 'scheduled tribe', 'अनुसूचित जनजाति'],
+    },
+    state: { rajasthan: ['rajasthan', 'राजस्थान', 'rj'] },
+    religion: { hindu: ['hindu', 'हिंदू', 'हिन्दू'], muslim: ['muslim', 'islam', 'मुस्लिम', 'इस्लाम'], sikh: ['sikh', 'सिख'], christian: ['christian', 'ईसाई'], jain: ['jain', 'जैन'], buddhist: ['buddhist', 'बौद्ध'] },
+  };
 
-  let filled = 0;
-  const total = Object.keys(fieldMap).length;
+  // ── 3. Text helpers ───────────────────────────────────────────────────────
+  const NOISE = new Set(['ctl00', 'ctl01', 'content', 'place', 'holder', 'holder1', 'contentplaceholder1', 'cph', 'txt', 'ddl', 'lbl', 'rb', 'rbl', 'chk', 'main', 'body', 'tb', 'input', 'field', 'form', 'mc', 'ucl', 'uc', 'grd']);
 
-  for (const [profileKey, selectors] of Object.entries(fieldMap)) {
-    const value = profileData[profileKey];
-    if (!value) continue;
-
-    let el = null;
-    for (const sel of selectors) {
-      try {
-        el = document.querySelector(sel);
-        if (el) break;
-      } catch {}
+  function normalize(str) {
+    return String(str || '').toLowerCase().replace(/[’'`]/g, "'").replace(/[\s\-_.\/*:()[\]|,;#]+/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  function attrWords(str) {
+    return normalize(String(str || '').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/\d+/g, ' '))
+      .split(' ').filter((w) => w && !NOISE.has(w)).join(' ');
+  }
+  function textOf(node) {
+    if (!node) return '';
+    const clone = node.cloneNode(true);
+    clone.querySelectorAll && clone.querySelectorAll('input,select,textarea,script,style,option').forEach((n) => n.remove());
+    return (clone.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function lev(a, b) {
+    const m = a.length; const n = b.length;
+    if (!m) return n; if (!n) return m;
+    let prev = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) {
+      const cur = [i];
+      for (let j = 1; j <= n; j++) cur[j] = a[i - 1] === b[j - 1] ? prev[j - 1] : 1 + Math.min(prev[j], cur[j - 1], prev[j - 1]);
+      prev = cur;
     }
+    return prev[n];
+  }
 
-    // Fallback: find by label text
-    if (!el) {
-      const labelText = profileKey.replace(/_/g, ' ');
-      const labels = document.querySelectorAll('label');
-      for (const label of labels) {
-        if (label.textContent.toLowerCase().includes(labelText.toLowerCase())) {
-          const forId = label.getAttribute('for');
-          if (forId) el = document.getElementById(forId);
-          if (!el) el = label.querySelector('input, select, textarea');
-          if (!el) el = label.nextElementSibling?.querySelector?.('input, select, textarea') || label.nextElementSibling;
-          if (el && (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA')) break;
-          else el = null;
+  // ── 4. Label detection (works for ASP.NET table layouts too) ─────────────
+  function labelFor(el) {
+    const parts = [];
+    const aria = el.getAttribute('aria-label');
+    if (aria) parts.push(aria);
+    if (el.id) {
+      try {
+        const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (l) parts.push(textOf(l));
+      } catch (e) { /* ignore */ }
+    }
+    const wrap = el.closest('label');
+    if (wrap) parts.push(textOf(wrap));
+    const lb = el.getAttribute('aria-labelledby');
+    if (lb) lb.split(/\s+/).forEach((id) => { const n = document.getElementById(id); if (n) parts.push(textOf(n)); });
+    if (!parts.join('').trim()) {
+      const cell = el.closest('td,th');
+      if (cell) {
+        let prev = cell.previousElementSibling;
+        for (let k = 0; k < 2 && prev; k++, prev = prev.previousElementSibling) {
+          const tx = textOf(prev);
+          if (tx && tx.length < 120) { parts.push(tx); break; }
         }
       }
     }
+    if (!parts.join('').trim()) {
+      let prev = el.previousElementSibling;
+      for (let k = 0; k < 3 && prev; k++, prev = prev.previousElementSibling) {
+        const tx = textOf(prev);
+        if (tx && tx.length > 1 && tx.length < 120) { parts.push(tx); break; }
+      }
+    }
+    if (!parts.join('').trim() && el.parentElement) {
+      const pp = el.parentElement.previousElementSibling;
+      const tx = textOf(pp);
+      if (tx && tx.length < 120) parts.push(tx);
+    }
+    return parts.join(' ').replace(/\s*\*\s*/g, ' ').trim();
+  }
 
-    if (el && fillInput(el, String(value))) {
-      highlightField(el, 0.85);
-      filled++;
-      console.log(`[AutoFill Portal] ✓ ${profileKey} → "${value}"`);
+  function sectionContext(el) {
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < 12; depth++, node = node.parentElement) {
+      if (node.tagName === 'FIELDSET') {
+        const lg = node.querySelector('legend');
+        if (lg) return normalize(textOf(lg));
+      }
+      const h = node.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > legend, :scope > .panel-heading, :scope > .card-header');
+      if (h && !h.contains(el)) {
+        const tx = normalize(textOf(h));
+        if (tx.length > 2 && tx.length < 100) return tx;
+      }
+    }
+    return '';
+  }
+
+  function matchScore(text, cfg) {
+    if (!text) return 0;
+    const padded = ` ${text} `;
+    for (const ex of cfg.exclude) if (padded.includes(` ${normalize(ex)} `) || (normalize(ex).length > 4 && text.includes(normalize(ex)))) return 0;
+    let best = 0;
+    for (const kw of cfg.keywords) {
+      const k = normalize(kw);
+      if (!k) continue;
+      if (text === k) return 1;
+      if (padded.includes(` ${k} `)) best = Math.max(best, Math.min(0.95, 0.72 + (k.length / text.length) * 0.25));
+      else if (!cfg.word && k.length >= 5 && text.includes(k)) best = Math.max(best, 0.66);
+      else {
+        const kw2 = k.split(' ').filter((w) => w.length > 2);
+        if (kw2.length > 1) {
+          const tw = text.split(' ');
+          const hit = kw2.filter((w) => tw.includes(w)).length / kw2.length;
+          if (hit >= 0.99) best = Math.max(best, 0.7);
+        }
+      }
+    }
+    return best;
+  }
+
+  // ── 5. Saved field mappings ("Teach fields") ─────────────────────────────
+  const pageKey = () => location.hostname + location.pathname.toLowerCase();
+  let savedMappings = {};
+
+  async function loadMappings() {
+    if (!HAS_CHROME) return;
+    const { af_mappings } = await chrome.storage.local.get('af_mappings');
+    savedMappings = af_mappings || {};
+  }
+  async function saveMapping(el, field) {
+    const key = pageKey();
+    savedMappings[key] = savedMappings[key] || {};
+    if (field) savedMappings[key][selectorKey(el)] = field;
+    else savedMappings[key][selectorKey(el)] = '__ignore__';
+    if (HAS_CHROME) await chrome.storage.local.set({ af_mappings: savedMappings });
+  }
+  function selectorKey(el) {
+    if (el.id && !/^\d/.test(el.id)) return `#${el.id}`;
+    if (el.name) return `${el.tagName.toLowerCase()}[name="${el.name}"]`;
+    const parts = [];
+    let n = el;
+    while (n && n.nodeType === 1 && n !== document.body && parts.length < 7) {
+      let i = 1; let s = n;
+      while ((s = s.previousElementSibling)) if (s.tagName === n.tagName) i += 1;
+      parts.unshift(`${n.tagName.toLowerCase()}:nth-of-type(${i})`);
+      n = n.parentElement;
+    }
+    return parts.join('>');
+  }
+  function savedFieldFor(el) {
+    const page = savedMappings[pageKey()];
+    return page ? page[selectorKey(el)] || null : null;
+  }
+
+  // ── 6. Detection ──────────────────────────────────────────────────────────
+  function isVisible(el) {
+    if (el.disabled || el.readOnly) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    return el.getClientRects().length > 0;
+  }
+
+  function fillableElements() {
+    return Array.from(document.querySelectorAll('input, select, textarea')).filter((el) => {
+      if (el.tagName === 'INPUT') {
+        const t = (el.type || 'text').toLowerCase();
+        if (!['text', 'email', 'tel', 'number', 'date', 'search', ''].includes(t)) return false;
+        if (/captcha|otp|password|search/i.test(`${el.name} ${el.id} ${el.placeholder}`)) return false;
+      }
+      return isVisible(el) && !el.closest('#__smart_autofill_root');
+    });
+  }
+
+  function detectField(el) {
+    const saved = savedFieldFor(el);
+    if (saved === '__ignore__') return null;
+    if (saved) return { field: saved, score: 1, saved: true, label: labelFor(el) || el.name || el.id };
+    const label = normalize(labelFor(el));
+    const attrs = attrWords(`${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.title || ''}`);
+    const section = sectionContext(el);
+    let best = null;
+    for (const [field, cfg] of Object.entries(FIELD_MAP)) {
+      let score = Math.max(matchScore(label, cfg), matchScore(attrs, cfg) * 0.85);
+      if (/education_/.test(field) && section) score = Math.max(score, matchScore(`${label} ${section}`, cfg) * 0.95);
+      if (!best || score > best.score) best = { field, score };
+    }
+    if (!best || best.score < 0.62) {
+      // generic education labels inside a "Class X / XII" section
+      const sec = `${section} ${label}`;
+      const lbl = label;
+      const isXII = /\b(xii|12|12th|senior secondary|higher secondary)\b/.test(sec);
+      const isX = !isXII && /\b(x|10|10th|secondary|matric)\b/.test(sec);
+      const bucket = isXII ? '12th' : isX ? '10th' : null;
+      if (bucket) {
+        if (/^(percentage|grade|marks|percent)/.test(lbl)) best = { field: `education_${bucket}_percentage`, score: 0.75 };
+        else if (/^board/.test(lbl)) best = { field: `education_${bucket}_board`, score: 0.75 };
+        else if (/^(school|institution)/.test(lbl)) best = { field: `education_${bucket}_school`, score: 0.75 };
+        else if (/year/.test(lbl)) best = { field: `education_${bucket}_year`, score: 0.75 };
+      }
+    }
+    if (!best || best.score < 0.62) return null;
+    if (HINDI_VARIANT[best.field] && /hindi|हिंदी|हिन्दी/.test(label)) best.field = HINDI_VARIANT[best.field];
+    return { ...best, saved: false, label: labelFor(el) || el.placeholder || el.name || el.id };
+  }
+
+  // ── 7. Values and option matching ─────────────────────────────────────────
+  function toIso(v) {
+    const m = String(v || '').match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$/);
+    return m ? `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}` : null;
+  }
+
+  function valueFor(field, values) {
+    if (values[field] !== undefined && values[field] !== null && values[field] !== '') return values[field];
+    if (field === 'father_or_husband_name') return values.father_or_husband_name || values.father_name;
+    if (field === 'address_hi' || field === 'name_hi' || field === 'father_name_hi') return null; // never guess Hindi
+    return null;
+  }
+
+  function formatForElement(el, field, raw) {
+    let v = String(raw);
+    let note = null;
+    const ph = `${el.placeholder || ''} ${el.title || ''}`.toLowerCase();
+    if (field === 'dob' || /date/.test(field)) {
+      if (el.type === 'date') v = toIso(v) || v;
+      else if (/yyyy-mm-dd/.test(ph)) v = toIso(v) || v;
+      else if (/dd-mm-yyyy/.test(ph)) v = v.replace(/\//g, '-');
+    }
+    if (field === 'id_number') {
+      const digits = v.replace(/\D/g, '');
+      if ((el.maxLength > 0 && el.maxLength <= 12) || el.type === 'number' || !/\s/.test(el.placeholder || ' ')) v = digits;
+    }
+    if (field === 'phone') v = v.replace(/\D/g, '').slice(-10);
+    if (el.maxLength > 0 && v.length > el.maxLength) {
+      if (/\d/.test(v) && /\s/.test(v) && v.replace(/\s/g, '').length <= el.maxLength) v = v.replace(/\s/g, '');
+      else { v = v.slice(0, el.maxLength); note = 'shortened'; }
+    }
+    return { value: v, note };
+  }
+
+  function candidatesFor(field, value) {
+    const v = normalize(value);
+    const out = [v];
+    const group = field === 'gender' ? SYNONYMS.gender
+      : ['is_married', 'in_voter_list', 'husband_domicile'].includes(field) ? SYNONYMS.yesno
+        : field === 'caste_category' ? SYNONYMS.caste_category
+          : field === 'state' ? SYNONYMS.state
+            : field === 'religion' ? SYNONYMS.religion : null;
+    if (group) {
+      for (const list of Object.values(group)) if (list.map(normalize).includes(v)) out.push(...list.map(normalize));
+    }
+    if (field === 'district' && DISTRICT_HI[v]) out.push(normalize(DISTRICT_HI[v]));
+    return [...new Set(out.filter(Boolean))];
+  }
+
+  function chooseOption(select, field, value) {
+    const cands = candidatesFor(field, value);
+    const opts = Array.from(select.options).filter((o) => !o.disabled && o.value !== '' && !/^(-+|select|चुनें|--select--)/i.test(o.text.trim()));
+    const norm = (o) => [normalize(o.text), normalize(o.value)];
+    for (const c of cands) { const o = opts.find((x) => norm(x).includes(c)); if (o) return o; }
+    for (const c of cands.filter((x) => x.length >= 3)) {
+      const o = opts.find((x) => norm(x).some((t) => t.length >= 3 && (t.includes(c) || c.includes(t))));
+      if (o) return o;
+    }
+    for (const c of cands.filter((x) => x.length >= 5)) {
+      const o = opts.find((x) => norm(x).some((t) => lev(t, c) <= 1));
+      if (o) return o;
+    }
+    return null;
+  }
+
+  function setNativeValue(el, value) {
+    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : el.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (setter && setter.set) setter.set.call(el, value);
+    else el.value = value;
+    ['input', 'change', 'blur'].forEach((t) => el.dispatchEvent(new Event(t, { bubbles: true })));
+  }
+
+  function hasPostback(el) {
+    const oc = el.getAttribute('onchange') || '';
+    return /__doPostBack|submit\(|setTimeout\(/.test(oc) || el.getAttribute('autopostback') === 'true';
+  }
+
+  // ── 8. Build plan / fill ─────────────────────────────────────────────────
+  function radioGroups() {
+    const groups = {};
+    document.querySelectorAll('input[type="radio"]').forEach((r) => {
+      if (!r.name || !isVisible(r)) return;
+      (groups[r.name] = groups[r.name] || []).push(r);
+    });
+    return Object.values(groups);
+  }
+
+  function radioText(r) {
+    let t = '';
+    if (r.id) { try { const l = document.querySelector(`label[for="${CSS.escape(r.id)}"]`); if (l) t = textOf(l); } catch (e) { /* ignore */ } }
+    if (!t && r.nextSibling) t = (r.nextSibling.textContent || '').trim();
+    if (!t && r.closest('label')) t = textOf(r.closest('label'));
+    return normalize(t || r.value);
+  }
+
+  function buildPlan(values, { skipFilled = true } = {}) {
+    const plan = [];
+    for (const el of fillableElements()) {
+      const det = detectField(el);
+      if (!det) continue;
+      const raw = valueFor(det.field, values);
+      if (raw === null || raw === undefined || raw === '') continue;
+      const already = el.tagName === 'SELECT' ? el.selectedIndex > 0 && el.value : el.value && el.value.trim();
+      const entry = { el, field: det.field, label: det.label, score: det.score, saved: det.saved, include: !(skipFilled && already), already: !!already };
+      if (el.tagName === 'SELECT') {
+        const opt = chooseOption(el, det.field, raw);
+        if (!opt) continue;
+        entry.value = opt.text.trim();
+        entry.option = opt;
+        entry.postback = hasPostback(el);
+      } else {
+        const f = formatForElement(el, det.field, raw);
+        entry.value = f.value;
+        entry.note = f.note;
+      }
+      plan.push(entry);
+    }
+    // radio groups (gender, marital status, category …)
+    for (const group of radioGroups()) {
+      const first = group[0];
+      const groupLabel = normalize(`${labelFor(first)} ${sectionContext(first)} ${attrWords(first.name)}`);
+      let field = null;
+      for (const f of ['gender', 'is_married', 'caste_category', 'religion', 'in_voter_list']) {
+        if (matchScore(groupLabel, FIELD_MAP[f] || F([f.replace(/_/g, ' ')])) >= 0.62) { field = f; break; }
+      }
+      if (!field) {
+        const texts = group.map(radioText).join(' ');
+        if (/\b(male|female)\b|पुरुष|महिला/.test(texts)) field = 'gender';
+      }
+      if (!field) continue;
+      const raw = valueFor(field, values);
+      if (!raw) continue;
+      const cands = candidatesFor(field, raw);
+      const target = group.find((r) => cands.includes(radioText(r)) || cands.some((c) => c.length >= 3 && radioText(r).includes(c)));
+      if (!target) continue;
+      plan.push({ el: target, radio: true, field, label: labelFor(first) || field, value: radioText(target), score: 0.8, include: !(skipFilled && group.some((r) => r.checked)), already: group.some((r) => r.checked) });
+    }
+    // fill dropdowns that reload the page LAST
+    plan.sort((a, b) => (a.postback ? 1 : 0) - (b.postback ? 1 : 0));
+    return plan;
+  }
+
+  function executePlan(plan) {
+    let filled = 0;
+    let postback = false;
+    for (const p of plan) {
+      if (!p.include) continue;
+      try {
+        if (p.radio) {
+          p.el.click();
+          p.el.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (p.option) {
+          if (p.postback) postback = true;
+          setNativeValue(p.el, p.option.value);
+        } else {
+          setNativeValue(p.el, p.value);
+        }
+        p.el.style.outline = '2px solid rgba(34,197,94,0.85)';
+        setTimeout(() => { p.el.style.outline = ''; }, 4000);
+        filled += 1;
+        if (p.postback) break; // the page is reloading; continue after reload
+      } catch (e) { /* skip field */ }
+    }
+    return { filled, postback };
+  }
+
+  // ── 9. UI (shadow DOM so portal CSS cannot break it) ─────────────────────
+  let host = null;
+  let root = null;
+  function ui() {
+    if (root) return root;
+    host = document.createElement('div');
+    host.id = '__smart_autofill_root';
+    host.style.cssText = 'position:fixed;z-index:2147483647;top:0;left:0;width:0;height:0;';
+    document.documentElement.appendChild(host);
+    root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>
+      *{box-sizing:border-box;font-family:'Segoe UI','Nirmala UI',Arial,sans-serif}
+      .panel{position:fixed;top:16px;right:16px;width:420px;max-height:86vh;display:flex;flex-direction:column;background:#14141e;color:#f1f1f5;border:1px solid #333348;border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.55);font-size:13px}
+      .head{padding:12px 14px;border-bottom:1px solid #2a2a3a}
+      .who{font-size:15px;font-weight:700;color:#c4b5fd}
+      .sub{font-size:11px;color:#9a9ab0;margin-top:2px}
+      .warn{margin:8px 14px 0;padding:8px 10px;border-radius:8px;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.35);color:#fcd34d;font-size:12px}
+      .list{overflow:auto;padding:6px 10px;flex:1}
+      .row{display:grid;grid-template-columns:20px 1fr;gap:6px;align-items:start;padding:7px 6px;border-bottom:1px solid #22222f}
+      .row label{font-size:11px;color:#9a9ab0}
+      .row .f{font-size:11px;font-weight:700;color:#a78bfa;text-transform:uppercase;letter-spacing:.4px}
+      .row input[type=text]{width:100%;margin-top:3px;background:#0f0f16;border:1px solid #333348;border-radius:6px;color:#f1f1f5;padding:5px 7px;font-size:12.5px}
+      .tag{display:inline-block;font-size:10px;padding:0 6px;border-radius:8px;margin-left:4px}
+      .saved{background:#2e1065;color:#c4b5fd}.had{background:#3a2e1e;color:#fcd34d}.pb{background:#450a0a;color:#fca5a5}
+      .foot{padding:10px 14px;border-top:1px solid #2a2a3a;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+      button{border:none;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:13px}
+      .go{background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff}.no{background:#2a2a3a;color:#d4d4e0}
+      .fab{position:fixed;right:18px;bottom:18px;display:flex;align-items:center;gap:6px;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;border-radius:99px;padding:9px 14px;box-shadow:0 6px 22px rgba(0,0,0,.4);font-weight:700;cursor:pointer;font-size:13px}
+      .fab .x{opacity:.7;margin-left:6px;font-weight:400}
+      .pick{position:fixed;background:#14141e;color:#f1f1f5;border:1px solid #7c3aed;border-radius:10px;padding:10px;width:300px;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+      .pick select{width:100%;margin:6px 0;padding:6px;background:#0f0f16;color:#f1f1f5;border:1px solid #333348;border-radius:6px}
+      .toast{position:fixed;right:18px;bottom:70px;background:#064e3b;color:#d1fae5;border:1px solid #10b981;border-radius:10px;padding:10px 14px;max-width:360px;font-size:13px}
+      .toast.err{background:#450a0a;color:#fecaca;border-color:#ef4444}
+    </style><div id="layer"></div>`;
+    return root;
+  }
+  function layer() { return ui().getElementById('layer'); }
+  function clearLayer(keepFab) {
+    const l = layer();
+    Array.from(l.children).forEach((c) => { if (!(keepFab && c.classList.contains('fab'))) c.remove(); });
+  }
+  function toast(msg, err) {
+    const t = document.createElement('div');
+    t.className = `toast ${err ? 'err' : ''}`;
+    t.textContent = msg;
+    layer().appendChild(t);
+    setTimeout(() => t.remove(), 6000);
+  }
+
+  async function fetchActive(force) {
+    if (!HAS_CHROME) return window.__SMART_AUTOFILL_TEST_DATA__ || { active: null };
+    return new Promise((resolve) => chrome.runtime.sendMessage({ action: 'getActive', force: !!force }, (r) => resolve(r || { error: 'no_response' })));
+  }
+
+  function fieldLabels(data) {
+    const map = {};
+    (data.fields || []).forEach((f) => { map[f.key] = f.label && (f.label.en || f.key); });
+    return map;
+  }
+
+  async function openPreview() {
+    await loadMappings();
+    const data = await fetchActive(true);
+    if (data.error) { toast(data.error === 'not_paired' ? 'Smart Autofill: open the dashboard once so the extension can connect.' : 'Smart Autofill: app not reachable. Is it running?', true); return { ok: false, error: data.error }; }
+    if (!data.active) { toast('Smart Autofill: open a customer in the dashboard first.', true); return { ok: false, error: 'no_active' }; }
+    const labels = fieldLabels(data);
+    let skipFilled = true;
+    let plan = buildPlan(data.values, { skipFilled });
+    clearLayer(true);
+    const c = data.active.customer;
+    const svc = data.active.service;
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    const render = () => {
+      const include = plan.filter((p) => p.include).length;
+      panel.innerHTML = `
+        <div class="head">
+          <div class="sub">Filling details of</div>
+          <div class="who">${esc(c.name || 'Customer')} <span style="font-weight:400;color:#9a9ab0">#${esc(c.customer_no)}${c.aadhaar_last4 ? ` · Aadhaar ••••${esc(c.aadhaar_last4)}` : ''}</span></div>
+          ${svc ? `<div class="sub">Service: ${esc(svc.name && (svc.name.en || svc.id))}</div>` : ''}
+        </div>
+        ${plan.some((p) => p.postback) ? '<div class="warn">A dropdown on this page reloads the page. It is filled last — press ⚡ Fill again after the page reloads to continue.</div>' : ''}
+        ${plan.length === 0 ? '<div class="warn">No matching fields found on this page. Use “Teach fields” in the extension popup to show which box is which.</div>' : ''}
+        <div class="list">${plan.map((p, i) => `
+          <div class="row">
+            <input type="checkbox" data-i="${i}" ${p.include ? 'checked' : ''}/>
+            <div>
+              <div class="f">${esc(labels[p.field] || p.field)}${p.saved ? '<span class="tag saved">taught</span>' : ''}${p.already ? '<span class="tag had">has value</span>' : ''}${p.postback ? '<span class="tag pb">reloads page</span>' : ''}</div>
+              <label>→ ${esc((p.label || '').slice(0, 70))}</label>
+              ${p.option || p.radio ? `<div style="margin-top:3px">${esc(p.value)}</div>` : `<input type="text" data-v="${i}" value="${esc(p.value)}"/>`}
+              ${p.note === 'shortened' ? '<label style="color:#fcd34d">Shortened to fit the box — check it.</label>' : ''}
+            </div>
+          </div>`).join('')}</div>
+        <div class="foot">
+          <label style="font-size:12px;color:#9a9ab0;display:flex;gap:6px;align-items:center"><input type="checkbox" id="skip" ${skipFilled ? 'checked' : ''}/> Skip boxes that already have a value</label>
+          <span style="flex:1"></span>
+          <button class="no" id="cancel">Cancel</button>
+          <button class="go" id="fill" ${include ? '' : 'disabled'}>⚡ Fill ${include}</button>
+        </div>`;
+      panel.querySelectorAll('input[data-i]').forEach((cb) => cb.addEventListener('change', () => { plan[+cb.dataset.i].include = cb.checked; render(); }));
+      panel.querySelectorAll('input[data-v]').forEach((inp) => inp.addEventListener('input', () => { plan[+inp.dataset.v].value = inp.value; }));
+      panel.querySelector('#skip').addEventListener('change', (e) => { skipFilled = e.target.checked; plan = buildPlan(data.values, { skipFilled }); render(); });
+      panel.querySelector('#cancel').addEventListener('click', () => panel.remove());
+      panel.querySelector('#fill').addEventListener('click', () => {
+        const r = executePlan(plan);
+        panel.remove();
+        toast(`Filled ${r.filled} field(s). Check every value before you submit.${r.postback ? ' The page is reloading — press ⚡ Fill again afterwards.' : ''}`);
+      });
+    };
+    render();
+    layer().appendChild(panel);
+    return { ok: true, fields: plan.length };
+  }
+
+  // ── 10. Teach mode ────────────────────────────────────────────────────────
+  let learning = false;
+  async function onLearnClick(e) {
+    const el = e.target && e.target.closest && e.target.closest('input, select, textarea');
+    if (!el || el.closest('#__smart_autofill_root')) return;
+    if (el.type && ['button', 'submit', 'checkbox', 'radio', 'hidden', 'password', 'file'].includes(el.type)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const data = await fetchActive(false);
+    const fields = (data && data.fields) || Object.keys(FIELD_MAP).map((k) => ({ key: k, label: { en: k } }));
+    clearLayer(true);
+    const r = el.getBoundingClientRect();
+    const pick = document.createElement('div');
+    pick.className = 'pick';
+    pick.style.top = `${Math.min(window.innerHeight - 170, r.bottom + 6)}px`;
+    pick.style.left = `${Math.min(window.innerWidth - 320, Math.max(8, r.left))}px`;
+    const current = savedFieldFor(el) || (detectField(el) || {}).field || '';
+    pick.innerHTML = `<div style="font-weight:700">What is this box?</div>
+      <div style="font-size:11px;color:#9a9ab0">${esc((labelFor(el) || el.name || el.id || '').slice(0, 60))}</div>
+      <select id="f"><option value="">— Ignore this box —</option>${fields.map((f) => `<option value="${esc(f.key)}" ${f.key === current ? 'selected' : ''}>${esc((f.label && (f.label.en + (f.label.hi ? ' / ' + f.label.hi : ''))) || f.key)}</option>`).join('')}</select>
+      <div style="display:flex;gap:8px;justify-content:flex-end"><button class="no" id="c">Cancel</button><button class="go" id="s">Save</button></div>`;
+    layer().appendChild(pick);
+    pick.querySelector('#c').addEventListener('click', () => pick.remove());
+    pick.querySelector('#s').addEventListener('click', async () => {
+      await saveMapping(el, pick.querySelector('#f').value || null);
+      el.style.outline = '2px solid #a78bfa';
+      pick.remove();
+    });
+  }
+  function setLearning(on) {
+    learning = !!on;
+    if (learning) {
+      document.addEventListener('click', onLearnClick, true);
+      fillableElements().forEach((el) => { el.dataset.afOutline = el.style.outline; el.style.outline = savedFieldFor(el) ? '2px solid #a78bfa' : '2px dashed #a78bfa'; });
+      toast('Teach mode ON: click any box and choose what it is. Turn it off in the extension popup.');
+    } else {
+      document.removeEventListener('click', onLearnClick, true);
+      fillableElements().forEach((el) => { el.style.outline = el.dataset.afOutline || ''; });
+      clearLayer(true);
     }
   }
 
-  console.log(`[AutoFill Portal] Filled ${filled}/${total} fields for ${schemeId}`);
-  return { filled, total };
-}
+  // ── 11. Floating button on portal forms ──────────────────────────────────
+  async function maybeShowFab() {
+    if (window.top !== window) return; // only in the top page
+    if (fillableElements().length < 3) return;
+    const data = await fetchActive(false);
+    if (!data || !data.active) return;
+    const fab = document.createElement('div');
+    fab.className = 'fab';
+    fab.innerHTML = `⚡ Fill: ${esc((data.active.customer.name || 'customer').split(' ')[0])}<span class="x" title="Hide">✕</span>`;
+    fab.addEventListener('click', (e) => {
+      if (e.target.classList.contains('x')) { fab.remove(); return; }
+      openPreview();
+    });
+    layer().appendChild(fab);
+  }
+
+  // ── 12. Messages from the popup ───────────────────────────────────────────
+  if (HAS_CHROME) {
+    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      (async () => {
+        await loadMappings();
+        if (msg.action === 'scan') {
+          const els = fillableElements();
+          const detected = els.map(detectField).filter(Boolean);
+          sendResponse({ inputs: els.length, detected: detected.length, taught: detected.filter((d) => d.saved).length, learning });
+        } else if (msg.action === 'preview') {
+          if (window.top !== window) { sendResponse({ ok: false, frame: true }); return; }
+          sendResponse(await openPreview());
+        } else if (msg.action === 'learn') {
+          setLearning(msg.on);
+          sendResponse({ ok: true, learning });
+        } else if (msg.action === 'clearMappings') {
+          delete savedMappings[pageKey()];
+          await chrome.storage.local.set({ af_mappings: savedMappings });
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({});
+        }
+      })();
+      return true;
+    });
+    loadMappings().then(() => setTimeout(maybeShowFab, 800));
+  }
+
+  // Test hook (only when the page defines the flag before injection)
+  if (window.__SMART_AUTOFILL_TEST__) {
+    window.__smartAutofill = { buildPlan, executePlan, detectField, fillableElements, labelFor, chooseOption, openPreview };
+  }
+})();

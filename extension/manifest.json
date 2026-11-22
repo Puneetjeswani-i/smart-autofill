@@ -1,18 +1,18 @@
 {
   "manifest_version": 3,
-  "name": "Smart Autofill Assistant",
-  "version": "1.0.0",
-  "description": "Automatically fill online forms using your securely stored profile data.",
-  "permissions": [
-    "activeTab",
-    "storage",
-    "scripting",
-    "tabs"
-  ],
+  "name": "Smart Autofill — eMitra Assistant",
+  "version": "6.0.0",
+  "description": "Fills the current customer's details from the Smart Autofill app on this computer into government portal forms — after you preview them.",
+  "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*",
     "http://localhost:3001/*",
-    "http://localhost:3000/*",
-    "<all_urls>"
+    "http://127.0.0.1:3001/*",
+    "https://*.gov.in/*",
+    "http://*.gov.in/*",
+    "https://*.nic.in/*",
+    "http://*.nic.in/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",
@@ -25,9 +25,20 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "https://*.gov.in/*",
+        "http://*.gov.in/*",
+        "https://*.nic.in/*",
+        "http://*.nic.in/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*",
+        "http://localhost:3001/*",
+        "http://127.0.0.1:3001/*",
+        "http://localhost:3000/*"
+      ],
       "js": ["content/content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "background": {
