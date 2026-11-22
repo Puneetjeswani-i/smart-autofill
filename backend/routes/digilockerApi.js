@@ -8,7 +8,7 @@
  * Mount at: /api/digilocker
  */
 
-require('dotenv').config();
+require('../config');
 const express = require('express');
 const axios   = require('axios');
 

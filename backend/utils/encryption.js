@@ -1,3 +1,8 @@
+/**
+ * LEGACY (v5) field encryption — no longer used by the app. In v5 it only
+ * encrypted top-level keys that did not exist, so profiles were stored in
+ * plain text. Kept for scripts/import-legacy.js. New code: utils/crypto.js.
+ */
 const CryptoJS = require('crypto-js');
 
 const SECRET_KEY = process.env.ENCRYPTION_KEY || 'smart-autofill-secret-key-2024-change-in-prod';
