@@ -131,7 +131,7 @@ function start() {
     console.log(`  Network: ${config.host === '127.0.0.1' ? 'this computer only (safe default)' : `listening on ${config.host} — other devices on the network can connect`}`);
     console.log(`  Customers on file: ${info.index.customers}${info.index.unreadable ? `  (${info.index.unreadable} unreadable — wrong master.key?)` : ''}`);
     console.log(`  Cloud AI (Groq): ${s.ai.available ? (s.ai.enabled ? `on (${config.groq.model})` : 'available but switched off') : 'not configured — local extraction only'}`);
-    if (info.keyCreated) console.log('  A new encryption key was created in backend/data/master.key — it is included in backups. Do not lose it.');
+    if (info.keyCreated) console.log(`  A new encryption key was created: ${config.keyFile}\n  It is included in backups. Do not lose it — without it the data cannot be read.`);
     if (config.demoMode) console.log('  DEMO_MODE is on (demo customer + simulated DigiLocker).');
     console.log('');
     require('./services/maintenance').startSchedules();

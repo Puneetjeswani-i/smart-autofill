@@ -118,14 +118,59 @@ class AiError extends Error {
   constructor(message, code) { super(message); this.code = code; }
 }
 
-async function callGroq(messages, { maxTokens = 900, json = true, temperature = 0.1, model } = {}) {
+// Groq retires models from time to time. If the configured model disappears,
+// pick the best available chat model automatically instead of silently
+// losing AI (this happened with llama-3.3-70b-versatile in 2026).
+const MODEL_PREFERENCE = ['openai/gpt-oss-120b', 'llama-3.3-70b', 'qwen/qwen3', 'openai/gpt-oss-20b', 'llama-4', 'llama'];
+const NOT_CHAT = /whisper|guard|orpheus|tts|playai|allam|safeguard|distil|embed/i;
+let fallbackModel = null;
+
+function effectiveModel() {
+  return fallbackModel || config.groq.model;
+}
+
+async function pickAvailableModel(exclude) {
+  const res = await fetch(config.groq.url.replace(/chat\/completions$/, 'models'), {
+    headers: { Authorization: `Bearer ${config.groq.apiKey}` },
+  });
+  const data = await res.json().catch(() => ({}));
+  const ids = (data.data || []).filter((m) => m.active !== false && !NOT_CHAT.test(m.id) && (m.context_window || 8192) >= 8192)
+    .map((m) => m.id).filter((id) => id !== exclude);
+  for (const pref of MODEL_PREFERENCE) {
+    const hit = ids.find((id) => id.startsWith(pref));
+    if (hit) return hit;
+  }
+  return ids[0] || null;
+}
+
+function isReasoningModel(model) {
+  return /gpt-oss/i.test(model);
+}
+
+async function callGroq(messages, opts = {}) {
+  try {
+    return await callGroqOnce(messages, opts);
+  } catch (err) {
+    if (err.code !== 'bad_model' || opts.model || opts.noFallback) throw err;
+    const failed = effectiveModel();
+    const next = await pickAvailableModel(failed).catch(() => null);
+    if (!next) throw err;
+    console.warn(`[ai] model "${failed}" is not available; using "${next}". Set GROQ_MODEL=${next} in backend/.env to make this permanent.`);
+    fallbackModel = next;
+    return callGroqOnce(messages, { ...opts, noFallback: true });
+  }
+}
+
+async function callGroqOnce(messages, { maxTokens = 900, json = true, temperature = 0.1, model } = {}) {
   if (!config.groq.apiKey) throw new AiError('Groq API key is not set (GROQ_API_KEY in backend/.env)', 'no_key');
+  const useModel = model || effectiveModel();
   const body = {
-    model: model || config.groq.model,
+    model: useModel,
     messages,
-    max_tokens: maxTokens,
+    max_tokens: isReasoningModel(useModel) ? Math.max(maxTokens * 2, 1500) : maxTokens,
     temperature,
   };
+  if (isReasoningModel(useModel)) body.reasoning_effort = 'low';
   if (json) body.response_format = { type: 'json_object' };
 
   let lastErr;
@@ -306,7 +351,7 @@ async function parseWithAi(text, docType) {
     detectedType: typeof raw.detected_doc_type === 'string' ? raw.detected_doc_type : null,
     tokens: usage.total_tokens || 0,
     ms: Date.now() - started,
-    model: config.groq.model,
+    model: effectiveModel(),
   };
 }
 
@@ -315,11 +360,11 @@ async function testConnection() {
     const { content } = await callGroq([
       { role: 'system', content: 'Reply with JSON only.' },
       { role: 'user', content: 'Return {"status":"ok"}' },
-    ], { maxTokens: 20 });
+    ], { maxTokens: 40 });
     const json = parseJsonLoose(content);
-    return { ok: json.status === 'ok', model: config.groq.model };
+    return { ok: json.status === 'ok', model: effectiveModel(), configured_model: config.groq.model };
   } catch (err) {
-    return { ok: false, model: config.groq.model, error: err.message, code: err.code };
+    return { ok: false, model: effectiveModel(), error: err.message, code: err.code };
   }
 }
 
@@ -339,4 +384,4 @@ ${JSON.stringify(context, null, 1).slice(0, 6000)}`,
   return content || '';
 }
 
-module.exports = { maskForAi, parseWithAi, groundingScore, testConnection, askAssistant, AiError, _internal: { buildMessages, cleanAiValue } };
+module.exports = { maskForAi, parseWithAi, groundingScore, testConnection, askAssistant, effectiveModel, AiError, _internal: { buildMessages, cleanAiValue } };

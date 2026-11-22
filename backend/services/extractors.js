@@ -291,6 +291,13 @@ function extractPincode(text, address) {
 }
 
 const ADDRESS_END = /(\b[1-8]\d{2}\s?\d{3}\b|help@uidai|www\.|1947|aadhaar|आधार|signature|हस्ताक्षर)/i;
+// A new "Label:" line means the address is over (bill date, units, mobile, ...).
+const ADDRESS_STOP = /^(dob|d\.o\.b|date|bill|due|units?|amount|total|k\.?\s*no|consumer|meter|mobile|mob|phone|ph\.?|e-?mail|gender|sex|male|female|vid|enrol|issue|valid|epic|account|a\/c|ifsc|roll|name|father|mother|husband|जन्म|मोबाइल|लिंग)\b/i;
+
+/** Remove a leading "S/O: Name," / "W/O Name," / "C/O Name," segment — it is a relation, not a place. */
+function stripRelationPrefix(addr) {
+  return String(addr || '').replace(/^\s*(s\/o|d\/o|w\/o|c\/o|h\/o)\s*[:\-]?\s*[^,]{2,40},\s*/i, '').trim();
+}
 
 function extractAddress(text) {
   const ls = lines(text);
@@ -299,14 +306,19 @@ function extractAddress(text) {
   const parts = [];
   const first = ls[startIdx].replace(/.*?(address|पता)\s*[:\-]?\s*/i, '').trim();
   if (first) parts.push(first);
-  for (let i = startIdx + 1; i < Math.min(ls.length, startIdx + 7); i++) {
-    if (/^(dob|date of birth|male|female|mobile|phone|vid|enrolment)/i.test(ls[i])) break;
-    parts.push(ls[i]);
-    if (ADDRESS_END.test(ls[i])) break;
+  if (!(first && ADDRESS_END.test(first))) {
+    for (let i = startIdx + 1; i < Math.min(ls.length, startIdx + 7); i++) {
+      if (ADDRESS_STOP.test(ls[i])) break;
+      parts.push(ls[i]);
+      if (ADDRESS_END.test(ls[i])) break;
+    }
   }
   const latin = parts.filter((p) => /[A-Za-z]/.test(p) && !/[ऀ-ॿ]/.test(p));
   const chosen = latin.length >= Math.ceil(parts.length / 2) ? latin : parts;
-  const address = chosen.join(', ').replace(/\s*,\s*,+/g, ', ').replace(/\s{2,}/g, ' ').replace(/^,\s*|,\s*$/g, '').trim();
+  const joined = chosen.join(', ').replace(/\s*,\s*,+/g, ', ').replace(/\s{2,}/g, ' ').replace(/^,\s*|,\s*$/g, '').trim();
+  // cut anything after the PIN code (e.g. "…Jaipur 303301 Bill Date: …")
+  const pinCut = joined.match(/^(.*?\b[1-8]\d{2}\s?\d{3}\b)/);
+  const address = stripRelationPrefix(pinCut ? pinCut[1] : joined);
   if (address.length < 10) return null;
   const hindiParts = parts.filter((p) => /[ऀ-ॿ]/.test(p));
   return {
@@ -344,8 +356,9 @@ function parseAddressComponents(address) {
   const po = address.match(/\b(?:p\.?\s?o\.?|post(?:\s*office)?|डाकघर)\s*[:\-]?\s*([A-Za-zऀ-ॿ ]{3,30})/i);
   if (po) out.post_office = V.titleCase(po[1].trim());
 
-  const house = parts.find((p) => /^(h\.?\s?no\.?|house|plot|flat|म\.?\s?न\.?|#)?\s*[\dA-Z]{1,6}([\/-]\d+)?\b/i.test(p) && /\d/.test(p) && p.length <= 30);
-  if (house) out.house_no = house.replace(/^(h\.?\s?no\.?|house\s*no\.?|plot\s*no\.?)\s*[:\-]?\s*/i, '').trim();
+  const houseRx = /^(?:h\.?\s?no\.?|house\s*(?:no\.?)?|plot\s*(?:no\.?)?|flat\s*(?:no\.?)?|म\.?\s?न\.?|#)?\s*[:\-]?\s*(\d{1,5}[A-Z]?(?:[\/-]\d{1,4}[A-Z]?)?)\b/i;
+  const house = parts.find((p) => houseRx.test(p) && !/^\s*\d{3}\s?\d{3}\s*$/.test(p));
+  if (house) out.house_no = house.match(houseRx)[1];
 
   // village / city: the part just before the district/state parts, if it is not the house part
   const clean = parts.filter((p) => !/^(s\/o|d\/o|w\/o|c\/o)\b/i.test(p));
@@ -560,6 +573,7 @@ function extractLocal(text, docType) {
   }
   const rel = extractRelations(t);
   for (const [k, v] of Object.entries(rel)) put(k, v);
+  if (rel._relation_name) warnings.push('relation_name_ambiguous');
 
   if (!fields.dob) put('dob', extractDOB(t, docType));
   if (!fields.gender) put('gender', extractGender(t));

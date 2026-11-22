@@ -1,381 +1,252 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import ProfilePanel from './components/ProfilePanel';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { api, setToken, setUnauthorizedHandler } from './api';
+import { LangProvider, makeT } from './i18n';
+import { AppContext, BACKEND_ORIGIN } from './AppContext';
+import LoginScreen from './components/LoginScreen';
+import HomePanel from './components/HomePanel';
+import CustomersPanel, { NewCustomerModal } from './components/CustomersPanel';
+import CustomerWorkspace from './components/CustomerWorkspace';
+import ApplicationsPanel from './components/ApplicationsPanel';
+import ToolsPanel from './components/ToolsPanel';
+import SettingsPanel from './components/SettingsPanel';
 import ExtensionGuide from './components/ExtensionGuide';
-import VerifyPanel from './components/VerifyPanel';
 import DigiLockerPanel from './components/DigiLockerPanel';
-import EligibilityPanel from './components/EligibilityPanel';
-import GroqUploadPanel from './components/GroqUploadPanel';
-import VerifyData from './components/VerifyData';
 import AIChatbot from './components/AIChatbot';
+import { Spinner } from './components/common';
 import emitraLogo from './emitra-logo.png';
 import './App.css';
 
-const TRANSLATIONS = {
-  en: {
-    appTitle: 'Citizen Services',
-    appSub: 'e-Mitra Assistant',
-    loginBtn: 'Login with DigiLocker',
-    eligibilityTab: 'My Eligibility',
-    applyBtn: 'Apply Now',
-    whyNot: 'Why not eligible?',
-    eligible: 'Eligible',
-    ineligible: 'Not Eligible',
-    submitBtn: 'Submit Application',
-    autoFilled: 'Auto-filled from',
-    demoBtn: 'Load Demo Profile',
-    schemes: 'schemes',
-    qualify: 'You qualify for',
-    notQualify: 'Not eligible for',
-  },
-  hi: {
-    appTitle: 'नागरिक सेवा',
-    appSub: 'e-Mitra सहायक',
-    loginBtn: 'DigiLocker से लॉगिन करें',
-    eligibilityTab: 'मेरी पात्रता',
-    applyBtn: 'अभी आवेदन करें',
-    whyNot: 'अपात्र क्यों?',
-    eligible: 'पात्र',
-    ineligible: 'अपात्र',
-    submitBtn: 'आवेदन जमा करें',
-    autoFilled: 'स्वतः भरा गया —',
-    demoBtn: 'डेमो प्रोफ़ाइल लोड करें',
-    schemes: 'योजनाएं',
-    qualify: 'आप पात्र हैं',
-    notQualify: 'अपात्र हैं',
-  },
-};
-
 const NAV = [
-  { id: 'digilocker',  labelKey: 'loginBtn',       icon: '🔐' },
-  { id: 'eligibility', labelKey: 'eligibilityTab',  icon: '📊', badge: 'NEW' },
-  { id: 'ai-upload',   label: 'AI Scanner',          icon: '⚡', badge: 'AI' },
-  { id: 'verify-data', label: 'Verify Data',         icon: '✅' },
-  { id: 'verify',      label: 'Verify & Readiness', icon: '🛡️' },
-  { id: 'profile',     label: 'My Profile',          icon: '◈' },
-  { id: 'extension',   label: 'Extension',            icon: '⬡' },
+  { id: 'home', key: 'home', icon: '🏠' },
+  { id: 'new', key: 'newCustomer', icon: '➕' },
+  { id: 'customers', key: 'customers', icon: '👥' },
+  { id: 'applications', key: 'applications', icon: '📋' },
+  { id: 'tools', key: 'tools', icon: '🧰' },
+  { id: 'settings', key: 'settings', icon: '⚙️' },
+  { id: 'extension', key: 'extension', icon: '⚡' },
 ];
 
-// Session ID for non-DigiLocker parts of the app (upload, profile, verify)
-function getOrCreateSessionId() {
-  let id = sessionStorage.getItem('af_session_id');
-  if (!id) {
-    // Try localStorage as fallback (persists across tabs)
-    id = localStorage.getItem('af_session_id');
-  }
-  if (!id) {
-    id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-      const r = (Math.random() * 16) | 0;
-      return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
-    });
-  }
-  // Store in both so extension and other tabs can find it
-  sessionStorage.setItem('af_session_id', id);
-  localStorage.setItem('af_session_id', id);
-  return id;
-}
-
 export default function App() {
-  const [activeTab, setActiveTab]           = useState('ai-upload');  // AI Scanner is default
-  const [language, setLanguage]             = useState('en');
-  const [profile, setProfile]               = useState(null);
-  const [completeness, setCompleteness]     = useState(null);
-  const [notification, setNotification]     = useState(null);
-  const [residenceReport, setResidenceReport] = useState(null);
-  const [fraudReport, setFraudReport]       = useState(null);
-  const [demoLoading, setDemoLoading]       = useState(false);
-  const [activeMainView, setActiveMainView] = useState('digilocker');
-  const [applyingScheme, setApplyingScheme] = useState(null);
+  const [lang, setLang] = useState(() => { try { return localStorage.getItem('sa_lang') || 'en'; } catch { return 'en'; } });
+  const [auth, setAuth] = useState({ state: 'loading' });
+  const [view, setView] = useState('home');
+  const [customerId, setCustomerId] = useState(null);
+  const [workspaceTab, setWorkspaceTab] = useState('documents');
+  const [catalog, setCatalog] = useState(null);
+  const [settingsData, setSettingsData] = useState(null);
+  const [activeSummary, setActiveSummary] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [newOpen, setNewOpen] = useState(false);
+  const [extensionPaired, setExtensionPaired] = useState(false);
+  const toastTimer = useRef(null);
 
-  // DigiLocker connection status — updated by DigiLockerPanel via onStatusChange
-  const [digilockerConnected, setDigilockerConnected] = useState(false);
+  const { t } = makeT(lang);
 
-  const sessionId = getOrCreateSessionId();
-  const t = (key) => TRANSLATIONS[language]?.[key] ?? key;
+  const toggleLang = () => {
+    const next = lang === 'hi' ? 'en' : 'hi';
+    setLang(next);
+    try { localStorage.setItem('sa_lang', next); } catch { /* ignore */ }
+  };
 
-  function sessionHeaders() {
-    return { 'Content-Type': 'application/json', 'X-Session-ID': sessionId };
-  }
+  const notify = useCallback((msg, type = 'success') => {
+    setToast({ msg, type });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), type === 'error' ? 6000 : 3500);
+  }, []);
 
-  useEffect(() => { fetchProfile(); }, []); // eslint-disable-line
-
-  async function fetchProfile() {
+  const checkAuth = useCallback(async () => {
     try {
-      const res  = await fetch('/api/profile', { headers: { 'X-Session-ID': sessionId } });
-      const data = await res.json();
-      if (data.profile) {
-        setProfile(data.profile);
-        setCompleteness(data.completeness || null);
-        setResidenceReport(data.residence_report || null);
-        setFraudReport(data.fraud_report || null);
-      }
-    } catch {}
-  }
-
-  function notify(msg, type = 'success') {
-    setNotification({ msg, type });
-    setTimeout(() => setNotification(null), 4000);
-  }
-
-  function handleNavChange(tabId) {
-    setActiveTab(tabId);
-    if (tabId === 'digilocker')        setActiveMainView('digilocker');
-    else if (tabId === 'eligibility')  setActiveMainView('eligibility');
-    else                               setActiveMainView('legacy');
-  }
-
-  async function saveProfile(updated) {
-    try {
-      const res = await fetch('/api/profile', {
-        method: 'PUT',
-        headers: sessionHeaders(),
-        body: JSON.stringify(updated),
-      });
-      const data = await res.json();
-      if (data.success) {
-        await fetchProfile();
-        notify('Profile saved securely!');
-      } else notify(data.error || 'Save failed', 'error');
-    } catch { notify('Could not connect to backend', 'error'); }
-  }
-
-  async function loadDemoProfile() {
-    setDemoLoading(true);
-    try {
-      const res = await fetch('/api/demo-profile', {
-        method: 'POST',
-        headers: sessionHeaders(),
-        body: JSON.stringify({}),
-      });
-      const data = await res.json();
-      if (data.success) {
-        setProfile(data.profile);
-        setCompleteness(data.completeness || null);
-        setResidenceReport(data.residence_report || null);
-        setFraudReport(data.fraud_report || null);
-        notify('Demo profile loaded — Amit Kumar, Jaipur, Rajasthan');
-        setActiveMainView('eligibility');
-        setActiveTab('eligibility');
-      } else {
-        notify(data.error || 'Failed to load demo profile', 'error');
-      }
-    } catch (e) {
-      notify('Backend not reachable: ' + e.message, 'error');
-    } finally {
-      setDemoLoading(false);
+      const s = await api('/api/auth/status');
+      if (s.setup_required) setAuth({ state: 'setup', shopName: s.shop_name, demo: s.demo_mode });
+      else if (s.logged_in) setAuth({ state: 'ok', shopName: s.shop_name, demo: s.demo_mode, version: s.version });
+      else setAuth({ state: 'login', shopName: s.shop_name, demo: s.demo_mode });
+    } catch (err) {
+      setAuth({ state: 'offline', error: err.message });
     }
+  }, []);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => setAuth((a) => (a.state === 'ok' ? { ...a, state: 'login' } : a)));
+    checkAuth();
+  }, [checkAuth]);
+
+  const reloadSettings = useCallback(async () => {
+    try {
+      const s = await api('/api/settings');
+      setSettingsData(s);
+      return s;
+    } catch { return null; }
+  }, []);
+
+  const refreshActive = useCallback(async () => {
+    try {
+      const r = await api('/api/customers/active');
+      setActiveSummary(r.active && r.active.customer ? r.active.customer : null);
+    } catch { /* ignore */ }
+  }, []);
+
+  // after login: vocabulary, settings, active customer, extension pairing
+  useEffect(() => {
+    if (auth.state !== 'ok') return undefined;
+    api('/api/meta/catalog').then(setCatalog).catch(() => {});
+    reloadSettings();
+    refreshActive();
+    let cancelled = false;
+    api('/api/settings/extension-key').then((r) => {
+      if (cancelled) return;
+      window.postMessage({ type: 'SMART_AUTOFILL_PAIR', key: r.key, backend: BACKEND_ORIGIN }, window.location.origin);
+    }).catch(() => {});
+    const onMsg = (e) => {
+      if (e.source !== window || e.origin !== window.location.origin) return;
+      if (e.data && e.data.type === 'SMART_AUTOFILL_PAIRED') setExtensionPaired(true);
+    };
+    window.addEventListener('message', onMsg);
+    return () => { cancelled = true; window.removeEventListener('message', onMsg); };
+  }, [auth.state, reloadSettings, refreshActive]);
+
+  const openCustomer = useCallback(async (id, tab = 'documents') => {
+    setCustomerId(id);
+    setWorkspaceTab(tab);
+    setView('customer');
+    try {
+      const r = await api('/api/customers/active', { method: 'POST', body: { customer_id: id } });
+      setActiveSummary(r.active.customer);
+    } catch { /* ignore */ }
+  }, []);
+
+  const finishCustomer = useCallback(async () => {
+    await api('/api/customers/active', { method: 'DELETE' }).catch(() => {});
+    setActiveSummary(null);
+    setCustomerId(null);
+    setView('home');
+  }, []);
+
+  const go = useCallback((v) => {
+    if (v === 'new') { setNewOpen(true); return; }
+    if (v === 'customer' && !customerId) { setView('customers'); return; }
+    setView(v);
+  }, [customerId]);
+
+  async function lock() {
+    await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    setToken(null);
+    setAuth((a) => ({ ...a, state: 'login' }));
   }
 
-  const score      = completeness?.score;
-  const scoreColor = score >= 75 ? '#4ade80' : score >= 50 ? '#fbbf24' : '#f87171';
+  const ctx = useMemo(() => ({
+    notify, catalog, settings: settingsData, reloadSettings, openCustomer, go,
+    extensionPaired, refreshActive, lang,
+  }), [notify, catalog, settingsData, reloadSettings, openCustomer, go, extensionPaired, refreshActive, lang]);
+
+  if (auth.state === 'loading') {
+    return <div className="login-wrap"><Spinner size={28} /></div>;
+  }
+  if (auth.state === 'offline') {
+    return (
+      <LangProvider lang={lang}>
+        <div className="login-wrap">
+          <div className="login-card">
+            <h2 style={{ marginBottom: 8 }}>⚠️ Server not reachable</h2>
+            <p className="dim small mb16">{auth.error}</p>
+            <p className="small dim mb16">Start the app with <b>start-shop.bat</b> (or <code>npm start</code> in the backend folder), then retry.</p>
+            <button className="btn btn-primary" onClick={() => { setAuth({ state: 'loading' }); checkAuth(); }}>↺ Retry</button>
+          </div>
+        </div>
+      </LangProvider>
+    );
+  }
+  if (auth.state === 'setup' || auth.state === 'login') {
+    return (
+      <LangProvider lang={lang}>
+        <LoginScreen setupRequired={auth.state === 'setup'} shopName={auth.shopName} lang={lang} onToggleLang={toggleLang}
+          onLoggedIn={() => { setAuth({ state: 'loading' }); checkAuth(); }} />
+      </LangProvider>
+    );
+  }
+
+  const shopName = (settingsData && settingsData.settings.shop.name) || auth.shopName || t('appSub');
+  const navActive = view === 'customer' ? 'customers' : view;
 
   return (
-    <div className="app-shell">
-      <div className="ambient" />
-      <aside className="sidebar">
-        <div className="sidebar-logo">
-          <div className="logo-icon emitra-logo-wrap">
-            <img src={emitraLogo} alt="eMitra" className="emitra-logo-img" />
-          </div>
-          <div>
-            <div className="logo-title">{t('appTitle')}</div>
-            <div className="logo-sub">{t('appSub')}</div>
-          </div>
-        </div>
-
-        <button
-          type="button"
-          onClick={() => setLanguage(prev => prev === 'en' ? 'hi' : 'en')}
-          style={{
-            fontSize: 12,
-            padding: '4px 14px',
-            borderRadius: 20,
-            border: '1px solid rgba(255,255,255,0.15)',
-            background: 'rgba(255,255,255,0.07)',
-            color: 'var(--text-muted)',
-            cursor: 'pointer',
-            margin: '0 auto 10px',
-            display: 'block',
-          }}
-          aria-label="Toggle language"
-        >
-          <span style={{ color: language === 'hi' ? '#fff' : 'var(--text-muted)' }}>हिं</span>
-          <span style={{ color: 'var(--text-muted)' }}> | </span>
-          <span style={{ color: language === 'en' ? '#fff' : 'var(--text-muted)' }}>EN</span>
-        </button>
-
-
-        {profile && completeness && (
-          <div className="sidebar-readiness">
-            <div className="sr-label">Application Readiness</div>
-            <div className="sr-row">
-              <div className="sr-bar">
-                <div className="sr-fill" style={{ width: `${score}%`, background: scoreColor }} />
+    <LangProvider lang={lang}>
+      <AppContext.Provider value={ctx}>
+        <div className="app-shell" lang={lang}>
+          <aside className="sidebar">
+            <div className="sidebar-logo">
+              <div className="logo-icon"><img src={emitraLogo} alt="eMitra" className="emitra-logo-img" /></div>
+              <div style={{ minWidth: 0 }}>
+                <div className="logo-title">{t('appTitle')}</div>
+                <div className="logo-sub" title={shopName}>{shopName}</div>
               </div>
-              <div className="sr-score" style={{ color: scoreColor }}>{score}%</div>
             </div>
-            {completeness.missing_fields?.filter(f => f.required).length > 0 && (
-              <div className="sr-missing">
-                ⚠ {completeness.missing_fields.filter(f => f.required).length} required fields missing
+
+            <button type="button" className="lang-toggle" onClick={toggleLang} aria-label="Language">
+              {lang === 'hi' ? <><b>हिं</b> | EN</> : <>हिं | <b>EN</b></>}
+            </button>
+
+            {activeSummary && (
+              <div className="active-customer" onClick={() => openCustomer(activeSummary.id, view === 'customer' ? workspaceTab : 'details')} title={t('workingOn')}>
+                <div className="ac-label">{t('workingOn')}</div>
+                <div className="ac-name">{activeSummary.name || t('unnamed')}</div>
+                <div className="ac-sub">#{activeSummary.customer_no}{activeSummary.phone ? ` · ${activeSummary.phone}` : ''}</div>
               </div>
             )}
-            {residenceReport && (
-              <div className="sr-residence" style={{
-                marginTop: 6, fontSize: 10,
-                color: residenceReport.status === 'eligible' ? '#4ade80'
-                     : residenceReport.status === 'partial'  ? '#fbbf24' : '#f87171',
-              }}>
-                🏠 Residence: {residenceReport.residence_years_estimated ?? '?'}yr est.
-                {residenceReport.status === 'eligible' ? ' ✓' : ' ⚠'}
+
+            <nav className="sidebar-nav">
+              {NAV.map((item) => (
+                <button key={item.id} className={`nav-item ${navActive === item.id ? 'active' : ''}`} onClick={() => go(item.id)}>
+                  <span className="nav-icon">{item.icon}</span>
+                  <span>{t(item.key)}</span>
+                  {item.id === 'extension' && !extensionPaired && <span className="nav-count" title="Extension not connected">!</span>}
+                </button>
+              ))}
+              {auth.demo && (
+                <button className={`nav-item ${view === 'digilocker' ? 'active' : ''}`} onClick={() => setView('digilocker')}>
+                  <span className="nav-icon">🔐</span><span>DigiLocker (demo)</span>
+                </button>
+              )}
+            </nav>
+
+            <div className="sidebar-footer">
+              <div className="security-badge">
+                <span>🔒</span>
+                <div>
+                  <div className="sec-title">{t('encrypted')}</div>
+                  <div className="sec-sub">{t('encryptedSub')}</div>
+                </div>
+              </div>
+              <button className="btn btn-secondary btn-sm btn-block" onClick={lock}>🔒 {t('lock')}</button>
+            </div>
+          </aside>
+
+          <main className="main-content">
+            {toast && (
+              <div className={`notification ${toast.type}`} role="status">
+                <span>{toast.type === 'success' ? '✓' : toast.type === 'error' ? '✕' : 'ℹ'}</span>{toast.msg}
               </div>
             )}
-          </div>
-        )}
 
-        <nav className="sidebar-nav">
-          {NAV.map(item => (
-            <div key={item.id}>
-              <button
-                data-id={item.id}
-                className={`nav-item ${activeTab === item.id ? 'active' : ''}`}
-                onClick={() => handleNavChange(item.id)}
-              >
-                <span className="nav-icon">{item.icon}</span>
-                <span>{item.labelKey ? t(item.labelKey) : item.label}</span>
-                {item.badge && <span className="nav-new">{item.badge}</span>}
-                {item.id === 'profile' && profile && <span className="nav-badge">●</span>}
-                {item.id === 'digilocker' && digilockerConnected && (
-                  <span className="nav-badge" style={{ color: '#4ade80' }}>●</span>
-                )}
-              </button>
-            </div>
-          ))}
-        </nav>
+            {view === 'home' && <HomePanel onNewCustomer={() => setNewOpen(true)} />}
+            {view === 'customers' && <CustomersPanel onNewCustomer={() => setNewOpen(true)} />}
+            {view === 'customer' && customerId && (
+              <CustomerWorkspace key={customerId} customerId={customerId} tab={workspaceTab} onTab={setWorkspaceTab}
+                onFinish={finishCustomer} onDeleted={() => { setActiveSummary(null); setCustomerId(null); setView('customers'); }}
+                onChanged={refreshActive} />
+            )}
+            {view === 'applications' && <ApplicationsPanel />}
+            {view === 'tools' && <ToolsPanel />}
+            {view === 'settings' && <SettingsPanel />}
+            {view === 'extension' && <ExtensionGuide />}
+            {view === 'digilocker' && auth.demo && <DigiLockerPanel />}
+          </main>
 
-        <div className="sidebar-footer">
-          <div className="security-badge">
-            <span>🔒</span>
-            <div>
-              <div className="sec-title">AES Encrypted</div>
-              <div className="sec-sub">Data encrypted locally on your device</div>
-            </div>
-          </div>
+          {newOpen && (
+            <NewCustomerModal onClose={() => setNewOpen(false)}
+              onCreated={(c) => { setNewOpen(false); openCustomer(c.id, 'documents'); notify(`${t('newCustomer')} #${c.customer_no}`); }} />
+          )}
+          {settingsData && settingsData.settings.ai.effective && <AIChatbot customerId={view === 'customer' ? customerId : null} />}
         </div>
-      </aside>
-
-      <main className="main-content" data-main-view={activeMainView} lang={language}>
-        {notification && (
-          <div className={`notification ${notification.type}`}>
-            <span>{notification.type === 'success' ? '✓' : notification.type === 'error' ? '✕' : 'ℹ'}</span>
-            {notification.msg}
-          </div>
-        )}
-
-        {activeTab === 'digilocker' && (
-          // DigiLockerPanel now manages its own state via useDigiLocker hook.
-          // onStatusChange lets App know whether to show the green dot in the nav.
-          // onViewSchemes navigates to the eligibility tab.
-          // onDemoLoad keeps the demo shortcut working.
-          <DigiLockerPanel
-            onStatusChange={setDigilockerConnected}
-            onViewSchemes={() => {
-              setActiveTab('eligibility');
-              setActiveMainView('eligibility');
-            }}
-            onDemoLoad={loadDemoProfile}
-            t={t}
-            language={language}
-          />
-        )}
-
-        {activeTab === 'eligibility' && (
-          <EligibilityPanel
-            sessionId={sessionId}
-            onApply={(scheme) => {
-              setApplyingScheme(scheme);
-              // Mool Niwas and all schemes now handled via Apply Now → portal redirect
-              notify('Opening application portal for ' + scheme.name);
-            }}
-            t={t}
-            language={language}
-          />
-        )}
-
-        {activeTab === 'ai-upload' && (
-          <GroqUploadPanel
-            sessionId={sessionId}
-            onSuccess={(data) => {
-              setProfile(data.data);
-              if (data.completeness) setCompleteness(data.completeness);
-              notify('AI extraction complete! ' + data.documents_successful + ' docs processed. Review the results below, then navigate to Verify & Readiness when ready.');
-              fetchProfile();
-              // No auto-redirect — user reviews results at their own pace
-            }}
-            onNavigateToVerify={() => setActiveTab('verify')}
-            onProfileReset={() => {
-              setProfile(null);
-              setCompleteness(null);
-              setResidenceReport(null);
-              setFraudReport(null);
-              setApplyingScheme(null);
-              setDigilockerConnected(false);
-              notify('Profile cleared — ready to scan a new person\'s documents', 'info');
-            }}
-            onError={(msg) => notify(msg, 'error')}
-          />
-        )}
-
-        {activeTab === 'verify' && (
-          <VerifyPanel
-            profile={profile}
-            completeness={completeness}
-            residenceReport={residenceReport}
-            fraudReport={fraudReport}
-            structuredProfile={profile}
-            sessionId={sessionId}
-          />
-        )}
-
-        {activeTab === 'verify-data' && (
-          <VerifyData
-            profile={profile}
-            sessionId={sessionId}
-            fraudReport={fraudReport}
-            onSaved={(updatedProfile) => {
-              setProfile(updatedProfile);
-              fetchProfile();
-            }}
-            onProceed={() => setActiveTab('eligibility')}
-          />
-        )}
-
-        {activeTab === 'profile' && (
-          <ProfilePanel
-            profile={profile}
-            structuredProfile={profile}
-            completeness={completeness}
-            onSave={saveProfile}
-            onDelete={async () => {
-              await fetch('/api/profile', {
-                method: 'DELETE',
-                headers: { 'X-Session-ID': sessionId },
-              });
-              setProfile(null);
-              setCompleteness(null);
-              setResidenceReport(null);
-              setFraudReport(null);
-              setDigilockerConnected(false);
-              setApplyingScheme(null);
-              setActiveMainView('digilocker');
-              notify('All data deleted', 'info');
-            }}
-          />
-        )}
-
-        {activeTab === 'extension' && <ExtensionGuide />}
-      </main>
-
-      {/* AI Chatbot - floats in corner */}
-      <AIChatbot sessionId={sessionId} />
-    </div>
+      </AppContext.Provider>
+    </LangProvider>
   );
 }

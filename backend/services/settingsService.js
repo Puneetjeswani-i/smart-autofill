@@ -41,7 +41,8 @@ function getSettings() {
   const s = merged();
   s.ai.available = !!config.groq.apiKey;
   s.ai.effective = s.ai.enabled && s.ai.available;
-  s.ai.model = config.groq.model;
+  s.ai.model = require('./groqService').effectiveModel();
+  s.ai.configured_model = config.groq.model;
   return s;
 }
 

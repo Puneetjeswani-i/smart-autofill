@@ -83,7 +83,9 @@ function mapMarksheet(fields, meta, warnings) {
     || (school && school.includes(',') ? school.split(',').map((s) => s.trim()).filter(Boolean).slice(-1)[0] : null);
   if (place) {
     fields[`education_${bucket}_place`] = V.titleCase(place);
-    meta[`education_${bucket}_place`] = { confidence: 0.55, method: meta._marks_school_college ? meta._marks_school_college.method : 'local' };
+    // inherit method/grounding from where the place came from (school_place or the school name)
+    const from = fields._marks_school_place ? meta._marks_school_place : meta._marks_school_college;
+    meta[`education_${bucket}_place`] = { ...(from || { method: 'local' }), confidence: 0.55 };
   }
 }
 

@@ -64,6 +64,8 @@ test('Aadhaar front: number (checksum), name, Hindi name, DOB, gender', () => {
 test('Aadhaar back: address, husband (W/O), PIN, district, state', () => {
   const r = extractLocal(F.AADHAAR_BACK, 'aadhaar');
   assert.match(r.fields.address, /Gandhi Nagar/);
+  assert.doesNotMatch(r.fields.address, /W\/O|Ramesh/, 'relation prefix is not part of the address');
+  assert.equal(r.fields.house_no, '45');
   assert.equal(r.fields.pincode, '303301');
   assert.equal(r.fields.state, 'Rajasthan');
   assert.equal(r.fields.district, 'Jaipur');
@@ -92,6 +94,9 @@ test('Electricity bill: name, bill date, PIN', () => {
   assert.equal(r.fields.name, 'Sunita Sharma');
   assert.equal(r.evidence.bill_date, '05/06/2015');
   assert.equal(r.fields.pincode, '303301');
+  assert.equal(r.fields.address, '45 Gandhi Nagar Bassi Jaipur 303301', 'address stops at the PIN code');
+  assert.equal(r.fields.house_no, '45');
+  assert.equal(r.fields.id_number, undefined, 'K number is not an Aadhaar number');
 });
 
 test('Class 10 marksheet: class, board, year, roll, mother', () => {

@@ -75,7 +75,8 @@ const config = {
 
   groq: {
     apiKey: isPlaceholder(process.env.GROQ_API_KEY) ? null : String(process.env.GROQ_API_KEY).trim(),
-    model: envStr('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+    // If this model is retired by Groq, the app switches to an available one automatically.
+    model: envStr('GROQ_MODEL', 'openai/gpt-oss-120b'),
     url: envStr('GROQ_API_URL', 'https://api.groq.com/openai/v1/chat/completions'),
     timeoutMs: envInt('GROQ_TIMEOUT_MS', 30000),
   },
