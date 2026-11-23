@@ -1,12 +1,20 @@
 {
   "name": "smart-autofill-backend",
-  "version": "4.1.0",
-  "description": "Smart Autofill v4 — AI-powered government form assistant with DigiLocker OAuth",
+  "version": "6.0.0",
+  "private": true,
+  "description": "Smart Autofill v6 — eMitra / CSC shop assistant: document reading, eligibility, autofill, registers",
   "main": "server.js",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "check": "node -e \"['express','axios','cors','dotenv','express-session','uuid','multer','pdf-lib','pdf-parse'].forEach(m=>{try{require(m);console.log('✅',m)}catch{console.error('❌ MISSING:',m)}})\""
+    "test": "node --test \"test/*.test.js\"",
+    "ocr:download": "node scripts/download-ocr-data.js",
+    "reset-pin": "node scripts/reset-pin.js",
+    "import-legacy": "node scripts/import-legacy.js",
+    "check": "node -e \"['express','cors','dotenv','multer','pdf-lib','pdf-parse','sharp','tesseract.js'].forEach(m=>{try{require(m);console.log('OK ',m)}catch{console.error('MISSING:',m)}});require('node:sqlite');console.log('OK  node:sqlite')\""
   },
   "dependencies": {
     "axios": "^1.6.7",
