@@ -1,485 +1,387 @@
 /**
- * services/groqService.js
+ * services/groqService.js — optional cloud AI (Groq LLM) for document parsing.
  *
- * Reusable Groq LLM integration for intelligent document parsing.
+ * Privacy rules enforced here:
+ *   - Aadhaar numbers, Aadhaar VIDs and long digit runs (bank accounts) are
+ *     masked BEFORE any text leaves this computer. Those numbers are always
+ *     read by the local extractor instead.
+ *   - Nothing is sent when AI is switched off in Settings or no key is set.
  *
- * Pipeline:
- *   Raw OCR text → detectDocType() → buildPrompt() → Groq API → parsed JSON
- *
- * Document types supported:
- *   aadhaar, pan, passport, driving_license, voter_id, marksheet,
- *   electricity_bill, bank_statement, income_certificate, caste_certificate
+ * Accuracy rules:
+ *   - The model must copy values as printed and use null when absent.
+ *   - Every returned value is "grounded": checked against the OCR text.
+ *     Values that cannot be found in the text are kept only as low-confidence
+ *     suggestions and flagged for the operator.
  */
 
-require('dotenv').config();
-const https = require('https');
+'use strict';
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL   = process.env.GROQ_MODEL || 'llama3-70b-8192';
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const { config } = require('../config');
+const V = require('./validators');
 
-// ─── Document type detection from raw OCR text ───────────────────────────────
+// ── Masking ──────────────────────────────────────────────────────────────────
 
-const DOC_TYPE_SIGNALS = {
-  aadhaar: [
-    /aadhaar/i, /unique\s*identification/i, /UIDAI/i,
-    /\b\d{4}\s\d{4}\s\d{4}\b/, /enrollment\s*no/i,
-  ],
-  pan: [
-    /permanent\s*account\s*number/i, /income\s*tax\s*department/i,
-    /\b[A-Z]{5}\d{4}[A-Z]\b/,
-  ],
-  passport: [
-    /republic\s*of\s*india.*passport/i, /passport\s*no/i,
-    /place\s*of\s*issue/i, /date\s*of\s*expiry/i,
-    /\bP<IND\b/, /\bV\d{7}\b/,
-  ],
-  driving_license: [
-    /driving\s*licen[cs]e/i, /transport\s*department/i,
-    /class\s*of\s*vehicle/i, /valid\s*till/i,
-    /LMV/i, /MCWG/i, /authorisation\s*to\s*drive/i,
-  ],
-  voter_id: [
-    /election\s*commission/i, /elector.*photo.*identity/i,
-    /voter/i, /assembly\s*constituency/i, /polling\s*station/i,
-    /EPIC/i,
-  ],
-  marksheet: [
-    /board\s*of\s*secondary/i, /CBSE/i, /ICSE/i,
-    /marksheet/i, /mark\s*sheet/i, /certificate\s*of\s*merit/i,
-    /percentage/i, /division/i, /subject.*marks/i,
-    /class\s*(x|xii|10|12)/i,
-  ],
-  electricity_bill: [
-    /electricity/i, /power\s*supply/i, /BESCOM/i, /UPPCL/i, /KESCO/i,
-    /consumer\s*id/i, /meter\s*no/i, /units\s*consumed/i,
-    /billing\s*month/i,
-  ],
-  income_certificate: [
-    /income\s*certificate/i, /annual\s*income/i,
-    /tehsil/i, /revenue\s*department/i,
-  ],
-  caste_certificate: [
-    /caste\s*certificate/i, /scheduled\s*caste/i, /OBC/i, /ST\b/,
-    /social\s*justice/i, /backward\s*class/i,
-  ],
-  bank_statement: [
-    /bank\s*statement/i, /account\s*number/i,
-    /IFSC/i, /debit/i, /credit/i, /balance/i,
-    /transaction/i,
-  ],
+function maskForAi(text) {
+  let s = String(text || '');
+  // 16-digit VID first, then 12-digit Aadhaar (with or without spaces)
+  s = s.replace(/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, 'XXXX XXXX XXXX XXXX');
+  s = s.replace(/\b(\d{4})[\s-]?(\d{4})[\s-]?(\d{4})\b/g, (m, a, b, c) => `XXXX XXXX ${c}`);
+  // any other run of 9+ digits (bank account, ration card, consumer numbers)
+  s = s.replace(/\b\d{9,18}\b/g, (m) => 'X'.repeat(m.length - 4) + m.slice(-4));
+  return s;
+}
+
+// ── Prompt ───────────────────────────────────────────────────────────────────
+
+const COMMON_KEYS = {
+  name: 'applicant full name in English as printed',
+  name_hindi: 'applicant name in Devanagari if printed, else null',
+  father_name: "father's name (from 'Father's Name', 'S/O', 'D/O', 'पिता')",
+  father_name_hindi: "father's name in Devanagari if printed",
+  mother_name: "mother's name if printed",
+  husband_name: "husband's name ONLY if 'Husband' or 'W/O' is printed",
+  dob: 'date of birth as DD/MM/YYYY (or YYYY if only year printed)',
+  gender: 'Male | Female | Transgender',
+  address: 'full address in English as one line',
+  address_hindi: 'full address in Devanagari if printed',
+  house_no: 'house/plot number', street: 'street/locality/ward', village_city: 'village/town/city',
+  post_office: 'post office', tehsil: 'tehsil/sub-district', district: 'district', state: 'state',
+  pincode: '6-digit PIN', mobile: '10-digit mobile if printed', email: 'email if printed',
+  date_of_issue: 'document issue date DD/MM/YYYY',
 };
 
-/**
- * Detect document type from OCR text.
- * Returns the type string and a confidence 0-1.
- */
-function detectDocumentType(text) {
-  const scores = {};
+const TYPE_KEYS = {
+  aadhaar: ['name', 'name_hindi', 'father_name', 'husband_name', 'dob', 'gender', 'address', 'address_hindi', 'house_no', 'street', 'village_city', 'post_office', 'tehsil', 'district', 'state', 'pincode', 'mobile', 'date_of_issue'],
+  pan: ['name', 'father_name', 'dob', 'pan_number'],
+  voter_id: ['name', 'name_hindi', 'father_name', 'husband_name', 'gender', 'dob', 'epic_number', 'address', 'district', 'state', 'pincode', 'assembly_constituency', 'date_of_issue'],
+  driving_license: ['name', 'father_name', 'dob', 'dl_number', 'address', 'district', 'state', 'pincode', 'date_of_issue', 'valid_till', 'blood_group'],
+  passport: ['name', 'father_name', 'mother_name', 'dob', 'gender', 'passport_number', 'place_of_birth', 'date_of_issue', 'date_of_expiry', 'address'],
+  marksheet: ['name', 'father_name', 'mother_name', 'dob', 'roll_number', 'board', 'class', 'school_college', 'school_place', 'year_of_passing', 'percentage', 'division', 'result'],
+  electricity_bill: ['name', 'address', 'district', 'state', 'pincode', 'consumer_number', 'bill_date', 'billing_month', 'discom'],
+  water_bill: ['name', 'address', 'district', 'state', 'pincode', 'consumer_number', 'bill_date'],
+  ration_card: ['name', 'father_name', 'address', 'district', 'state', 'pincode', 'ration_card_number', 'date_of_issue', 'caste_category'],
+  jan_aadhaar: ['name', 'name_hindi', 'father_name', 'husband_name', 'dob', 'gender', 'address', 'district', 'state', 'pincode', 'jan_aadhaar_id', 'annual_income', 'caste_category', 'religion'],
+  birth_certificate: ['name', 'father_name', 'mother_name', 'dob', 'gender', 'place_of_birth', 'address', 'date_of_issue'],
+  income_certificate: ['name', 'father_name', 'address', 'district', 'tehsil', 'annual_income', 'certificate_number', 'date_of_issue'],
+  caste_certificate: ['name', 'father_name', 'address', 'district', 'tehsil', 'caste', 'caste_category', 'certificate_number', 'date_of_issue'],
+  domicile_certificate: ['name', 'father_name', 'address', 'district', 'tehsil', 'certificate_number', 'date_of_issue'],
+  bank_passbook: ['name', 'father_name', 'address', 'bank_name', 'ifsc_code', 'account_opening_date'],
+  school_certificate: ['name', 'father_name', 'mother_name', 'dob', 'school_college', 'school_place', 'caste_category', 'date_of_issue'],
+  land_record: ['name', 'father_name', 'village_city', 'tehsil', 'district', 'caste'],
+  rent_agreement: ['name', 'address', 'district', 'state', 'pincode', 'date_of_issue'],
+  other: ['name', 'father_name', 'dob', 'gender', 'address', 'district', 'state', 'pincode', 'date_of_issue'],
+};
 
-  for (const [type, signals] of Object.entries(DOC_TYPE_SIGNALS)) {
-    let hits = 0;
-    for (const signal of signals) {
-      if (signal.test(text)) hits++;
-    }
-    if (hits > 0) scores[type] = hits / signals.length;
-  }
+const EXTRA_KEY_HELP = {
+  pan_number: '10-character PAN', epic_number: 'voter ID / EPIC number', dl_number: 'driving licence number',
+  passport_number: 'passport number', place_of_birth: 'place of birth', date_of_expiry: 'expiry date DD/MM/YYYY',
+  valid_till: 'valid till date', blood_group: 'blood group', roll_number: 'roll number',
+  board: 'examination board', class: '"10" or "12" or "Graduate"', school_college: 'school/college name',
+  school_place: 'school town/city', year_of_passing: 'year of passing YYYY', percentage: 'percentage like "75.33%"',
+  division: 'division', result: 'Pass/Fail', consumer_number: 'consumer / K number', bill_date: 'bill date DD/MM/YYYY',
+  billing_month: 'billing month like "Jun 2015"', discom: 'electricity company', ration_card_number: 'ration card number',
+  jan_aadhaar_id: 'Jan Aadhaar ID', annual_income: 'annual income as a plain number in rupees',
+  caste: 'caste name', caste_category: 'SC | ST | OBC | MBC | General', religion: 'religion',
+  certificate_number: 'certificate number', bank_name: 'bank name', ifsc_code: 'IFSC code',
+  account_opening_date: 'account opening date', assembly_constituency: 'assembly constituency',
+};
 
-  if (Object.keys(scores).length === 0) return { type: 'unknown', confidence: 0 };
-
-  const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
-  return { type: best[0], confidence: Math.round(best[1] * 100) };
+function buildMessages(maskedText, docType) {
+  const keys = TYPE_KEYS[docType] || TYPE_KEYS.other;
+  const schema = {};
+  for (const k of keys) schema[k] = COMMON_KEYS[k] || EXTRA_KEY_HELP[k] || k;
+  schema.detected_doc_type = 'your best guess of the document type';
+  return [
+    {
+      role: 'system',
+      content: [
+        'You extract data from OCR text of Indian government documents for an eMitra kiosk operator.',
+        'Return ONE JSON object only. Rules:',
+        '1. Copy values exactly as printed; only fix obvious OCR letter mistakes (0/O, 1/I, rn/m).',
+        '2. If a value is not clearly present, use null. Never guess or invent.',
+        '3. Names in English in Title Case. Keep Hindi (Devanagari) text as printed in *_hindi fields.',
+        '4. Dates as DD/MM/YYYY.',
+        '5. father_name is the father. husband_name only when "Husband" or "W/O" is printed. Never copy one into the other.',
+        '6. Numbers shown as XXXX are hidden on purpose: return them as null.',
+      ].join('\n'),
+    },
+    {
+      role: 'user',
+      content: `Document type (guess): ${docType}\n\nOCR TEXT:\n"""\n${maskedText.slice(0, 3500)}\n"""\n\nReturn JSON with exactly these keys:\n${JSON.stringify(schema, null, 2)}`,
+    },
+  ];
 }
 
-// ─── Prompt templates per document type ──────────────────────────────────────
+// ── HTTP ─────────────────────────────────────────────────────────────────────
 
-function buildPrompt(ocrText, docType) {
-  const FIELD_SCHEMAS = {
-    aadhaar: `{
-  "doc_type": "aadhaar",
-  "name": "Full name",
-  "dob": "DD/MM/YYYY",
-  "gender": "Male/Female/Other",
-  "aadhaar_number": "XXXX XXXX XXXX",
-  "address": "Full address string",
-  "pincode": "6-digit pincode",
-  "district": "District name",
-  "state": "State name",
-  "confidence": 0-100
-}`,
-    pan: `{
-  "doc_type": "pan",
-  "name": "Full name",
-  "father_name": "Father full name",
-  "dob": "DD/MM/YYYY",
-  "pan_number": "ABCDE1234F format",
-  "confidence": 0-100
-}`,
-    passport: `{
-  "doc_type": "passport",
-  "name": "Full name (Given + Surname)",
-  "surname": "Surname only",
-  "given_name": "Given name only",
-  "dob": "DD/MM/YYYY",
-  "gender": "Male/Female",
-  "nationality": "INDIAN",
-  "passport_number": "V1234567 format",
-  "place_of_birth": "City, State",
-  "place_of_issue": "City",
-  "date_of_issue": "DD/MM/YYYY",
-  "date_of_expiry": "DD/MM/YYYY",
-  "mrz_line1": "First MRZ line if visible",
-  "mrz_line2": "Second MRZ line if visible",
-  "confidence": 0-100
-}`,
-    driving_license: `{
-  "doc_type": "driving_license",
-  "name": "Full name",
-  "father_name": "S/D/W of name",
-  "dob": "DD/MM/YYYY",
-  "dl_number": "DL number e.g. UP78 20210012345",
-  "address": "Full address",
-  "pincode": "6-digit pincode",
-  "state": "State of issue",
-  "district": "District",
-  "vehicle_class": "LMV/MCWG etc",
-  "date_of_issue": "DD/MM/YYYY",
-  "valid_till": "DD/MM/YYYY",
-  "blood_group": "A+/B+ etc",
-  "issuing_authority": "RTO name",
-  "confidence": 0-100
-}`,
-    voter_id: `{
-  "doc_type": "voter_id",
-  "name": "Full name",
-  "father_name": "Father name",
-  "gender": "Male/Female",
-  "dob": "DD/MM/YYYY",
-  "voter_id": "Epic number e.g. XYP1234567",
-  "address": "Full address",
-  "pincode": "6-digit pincode",
-  "state": "State",
-  "district": "District",
-  "assembly_constituency": "Constituency name",
-  "part_number": "Part number",
-  "date_of_issue": "DD/MM/YYYY",
-  "confidence": 0-100
-}`,
-    marksheet: `{
-  "doc_type": "marksheet",
-  "name": "Student full name",
-  "roll_number": "Roll/Seat number",
-  "board": "CBSE/ICSE/State board name",
-  "class": "10/12/Graduate",
-  "school_college": "Institution name",
-  "year_of_passing": "YYYY",
-  "subjects": [{"subject": "name", "marks_obtained": 0, "max_marks": 0}],
-  "total_marks": 0,
-  "max_total_marks": 0,
-  "percentage": "95.38%",
-  "division": "First/Second/Third/Distinction",
-  "result": "Pass/Fail",
-  "confidence": 0-100
-}`,
-    electricity_bill: `{
-  "doc_type": "electricity_bill",
-  "name": "Consumer name",
-  "address": "Service address",
-  "pincode": "6-digit pincode",
-  "state": "State",
-  "district": "District/City",
-  "consumer_id": "Consumer ID",
-  "meter_number": "Meter number",
-  "billing_month": "Month Year",
-  "bill_date": "DD/MM/YYYY",
-  "due_date": "DD/MM/YYYY",
-  "units_consumed": 0,
-  "bill_amount": 0,
-  "discom": "Electricity board name",
-  "confidence": 0-100
-}`,
-    income_certificate: `{
-  "doc_type": "income_certificate",
-  "name": "Full name",
-  "father_name": "Father name",
-  "annual_income": 0,
-  "income_in_words": "Rupees X only",
-  "address": "Full address",
-  "state": "State",
-  "district": "District",
-  "tehsil": "Tehsil name",
-  "certificate_number": "Cert number",
-  "date_of_issue": "DD/MM/YYYY",
-  "issuing_authority": "Authority name",
-  "confidence": 0-100
-}`,
-    caste_certificate: `{
-  "doc_type": "caste_certificate",
-  "name": "Full name",
-  "father_name": "Father name",
-  "caste": "Caste name",
-  "caste_category": "SC/ST/OBC/General",
-  "sub_caste": "Sub-caste if any",
-  "address": "Full address",
-  "state": "State",
-  "district": "District",
-  "certificate_number": "Cert number",
-  "date_of_issue": "DD/MM/YYYY",
-  "issuing_authority": "Authority",
-  "confidence": 0-100
-}`,
-    unknown: `{
-  "doc_type": "detected_type_or_unknown",
-  "name": "Full name if found",
-  "dob": "DD/MM/YYYY if found",
-  "id_number": "Any ID number found",
-  "address": "Address if found",
-  "date_of_issue": "Issue date if found",
-  "other_fields": {},
-  "confidence": 0-100
-}`,
-  };
-
-  const schema = FIELD_SCHEMAS[docType] || FIELD_SCHEMAS.unknown;
-
-  return `You are an expert OCR post-processor for Indian government documents. Extract structured data from the following OCR text.
-
-DOCUMENT TYPE DETECTED: ${docType.toUpperCase().replace(/_/g, ' ')}
-
-OCR TEXT:
-"""
-${ocrText.substring(0, 3000)}
-"""
-
-INSTRUCTIONS:
-1. Extract ONLY fields that are clearly present in the text
-2. For missing fields, use null (not empty string)
-3. Correct obvious OCR errors (e.g., "0" vs "O", "1" vs "I", "rn" vs "m")
-4. For names: use proper Title Case
-5. For dates: normalize to DD/MM/YYYY format
-6. For Aadhaar: format as "XXXX XXXX XXXX"
-7. For PAN: format as 10-char alphanumeric (e.g., ABCDE1234F)
-8. Return ONLY valid JSON — no explanation, no markdown, no extra text
-
-RETURN THIS EXACT JSON STRUCTURE (fill in values, keep nulls for missing):
-${schema}`;
+class AiError extends Error {
+  constructor(message, code) { super(message); this.code = code; }
 }
 
-// ─── Core Groq API call ───────────────────────────────────────────────────────
+// Groq retires models from time to time. If the configured model disappears,
+// pick the best available chat model automatically instead of silently
+// losing AI (this happened with llama-3.3-70b-versatile in 2026).
+const MODEL_PREFERENCE = ['openai/gpt-oss-120b', 'llama-3.3-70b', 'qwen/qwen3', 'openai/gpt-oss-20b', 'llama-4', 'llama'];
+const NOT_CHAT = /whisper|guard|orpheus|tts|playai|allam|safeguard|distil|embed/i;
+let fallbackModel = null;
 
-/**
- * Call Groq API with a prompt.
- * Returns the raw response text.
- */
-async function callGroq(prompt, maxTokens = 1000) {
-  if (!GROQ_API_KEY) {
-    throw new Error('GROQ_API_KEY not set in .env');
-  }
+function effectiveModel() {
+  return fallbackModel || config.groq.model;
+}
 
-  const body = JSON.stringify({
-    model: GROQ_MODEL,
-    messages: [
-      {
-        role: 'system',
-        content: `You are an expert at extracting structured data from Indian government document OCR text. Always respond with valid JSON only. Never include markdown code blocks, explanations, or any text outside the JSON object.
-
-CRITICAL RULES:
-- "husband_name" must ONLY be filled if the document explicitly states the person is married and names their husband. NEVER copy father_name into husband_name.
-- "father_name" is the person's father. "husband_name" is only for married women's husband. These are different people.
-- If a document shows "S/O" (Son of) or "D/O" (Daughter of), that is the father_name, NOT husband_name.
-- "W/O" (Wife of) indicates husband_name for married women only.
-- If husband is not mentioned in the document, set husband_name to null.
-- percentage must be extracted as a string like "95.38%" — do not omit it if present.
-- class field must be exactly "10" or "12" or "Graduate" — not "Class X" or "Class XII".`,
-      },
-      { role: 'user', content: prompt },
-    ],
-    max_tokens: maxTokens,
-    temperature: 0.1, // Low temp for deterministic extraction
-    response_format: { type: 'json_object' }, // Force JSON mode
+async function pickAvailableModel(exclude) {
+  const res = await fetch(config.groq.url.replace(/chat\/completions$/, 'models'), {
+    headers: { Authorization: `Bearer ${config.groq.apiKey}` },
   });
+  const data = await res.json().catch(() => ({}));
+  const ids = (data.data || []).filter((m) => m.active !== false && !NOT_CHAT.test(m.id) && (m.context_window || 8192) >= 8192)
+    .map((m) => m.id).filter((id) => id !== exclude);
+  for (const pref of MODEL_PREFERENCE) {
+    const hit = ids.find((id) => id.startsWith(pref));
+    if (hit) return hit;
+  }
+  return ids[0] || null;
+}
 
-  return new Promise((resolve, reject) => {
-    const url = new URL(GROQ_API_URL);
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-    };
+function isReasoningModel(model) {
+  return /gpt-oss/i.test(model);
+}
 
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        // Handle non-200 HTTP responses
-        if (res.statusCode === 403) {
-          return reject(new Error('Groq API 403: Host not allowlisted or invalid key. Check GROQ_API_KEY in .env'));
-        }
-        if (res.statusCode === 429) {
-          return reject(new Error('Groq API rate limit exceeded. Wait 60s and retry.'));
-        }
-        if (res.statusCode >= 500) {
-          return reject(new Error('Groq API server error (' + res.statusCode + '). Try again later.'));
-        }
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) {
-            reject(new Error('Groq API error: ' + parsed.error.message));
-          } else {
-            const content = parsed.choices?.[0]?.message?.content;
-            resolve({ content, usage: parsed.usage });
-          }
-        } catch (e) {
-          reject(new Error('Failed to parse Groq response: ' + e.message));
-        }
+async function callGroq(messages, opts = {}) {
+  try {
+    return await callGroqOnce(messages, opts);
+  } catch (err) {
+    if (err.code !== 'bad_model' || opts.model || opts.noFallback) throw err;
+    const failed = effectiveModel();
+    const next = await pickAvailableModel(failed).catch(() => null);
+    if (!next) throw err;
+    console.warn(`[ai] model "${failed}" is not available; using "${next}". Set GROQ_MODEL=${next} in backend/.env to make this permanent.`);
+    fallbackModel = next;
+    return callGroqOnce(messages, { ...opts, noFallback: true });
+  }
+}
+
+async function callGroqOnce(messages, { maxTokens = 900, json = true, temperature = 0.1, model } = {}) {
+  if (!config.groq.apiKey) throw new AiError('Groq API key is not set (GROQ_API_KEY in backend/.env)', 'no_key');
+  const useModel = model || effectiveModel();
+  const body = {
+    model: useModel,
+    messages,
+    max_tokens: isReasoningModel(useModel) ? Math.max(maxTokens * 2, 1500) : maxTokens,
+    temperature,
+  };
+  if (isReasoningModel(useModel)) body.reasoning_effort = 'low';
+  if (json) body.response_format = { type: 'json_object' };
+
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), config.groq.timeoutMs);
+    try {
+      const res = await fetch(config.groq.url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${config.groq.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
       });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(30000, () => {
-      req.destroy();
-      reject(new Error('Groq API request timed out after 30s'));
-    });
-    req.write(body);
-    req.end();
-  });
-}
-
-// ─── Parse JSON from Groq response ───────────────────────────────────────────
-
-function parseGroqJSON(content) {
-  if (!content) throw new Error('Empty Groq response');
-
-  // Strip markdown fences if present (shouldn't happen with json_object mode)
-  let cleaned = content
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/i, '')
-    .replace(/```\s*$/i, '')
-    .trim();
-
-  // Find the first { and last } in case there's surrounding text
-  const start = cleaned.indexOf('{');
-  const end   = cleaned.lastIndexOf('}');
-  if (start !== -1 && end !== -1) {
-    cleaned = cleaned.slice(start, end + 1);
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 429 || res.status >= 500) {
+        lastErr = new AiError(res.status === 429 ? 'AI rate limit reached — try again in a minute' : `AI server error (${res.status})`, res.status === 429 ? 'rate_limited' : 'server_error');
+        const wait = Number(res.headers.get('retry-after')) * 1000 || 1500 * (attempt + 1);
+        await new Promise((r) => setTimeout(r, Math.min(wait, 8000)));
+        continue;
+      }
+      if (!res.ok || data.error) {
+        const msg = (data.error && data.error.message) || `HTTP ${res.status}`;
+        const code = /decommission|does not exist|not found/i.test(msg) ? 'bad_model' : res.status === 401 || res.status === 403 ? 'bad_key' : 'error';
+        throw new AiError(code === 'bad_model' ? `AI model "${body.model}" is not available — set GROQ_MODEL in backend/.env (${msg})` : `AI error: ${msg}`, code);
+      }
+      return { content: data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content, usage: data.usage || {} };
+    } catch (err) {
+      if (err.name === 'AbortError') lastErr = new AiError('AI request timed out', 'timeout');
+      else if (err instanceof AiError) throw err;
+      else lastErr = new AiError(`Cannot reach AI service (${err.message}) — check internet`, 'network');
+    } finally {
+      clearTimeout(timer);
+    }
   }
-
-  return JSON.parse(cleaned);
+  throw lastErr;
 }
 
-// ─── Main exported function ───────────────────────────────────────────────────
+function parseJsonLoose(content) {
+  if (!content) throw new Error('Empty AI response');
+  let s = String(content).trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start !== -1 && end !== -1) s = s.slice(start, end + 1);
+  return JSON.parse(s);
+}
+
+// ── Grounding ────────────────────────────────────────────────────────────────
+
+function normText(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9ऀ-ॿ]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
 
 /**
- * Process OCR text through Groq AI to extract structured document fields.
- *
- * @param {string} ocrText   - Raw OCR-extracted text
- * @param {string} [hint]    - Optional document type hint ('aadhaar', 'pan', etc.)
- * @returns {Promise<{parsed, docType, confidence, groqUsed, error}>}
+ * How well does `value` appear in the OCR text? 0..1
  */
-async function parseDocumentWithGroq(ocrText, hint = null) {
-  const startTime = Date.now();
+function groundingScore(key, value, text) {
+  if (value === null || value === undefined || value === '') return 0;
+  const raw = String(text || '');
+  if (/dob|date|valid_till|bill_date/.test(key)) {
+    const p = V.parseDate(value);
+    if (!p) return 0;
+    const dates = (raw.match(/\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{4}|\d{1,2}[\s\-]+[A-Za-z]{3,9}[\s\-,]+\d{4}/g) || []).map(V.parseDate).filter(Boolean);
+    if (!p.d) return raw.includes(String(p.y)) ? 1 : 0;
+    return dates.some((d) => d.d === p.d && d.m === p.m && d.y === p.y) ? 1 : raw.includes(String(p.y)) ? 0.4 : 0;
+  }
+  if (['pincode', 'mobile', 'phone', 'annual_income'].includes(key)) {
+    const digits = V.digitsOnly(value);
+    return digits && V.digitsOnly(raw).includes(digits) ? 1 : 0;
+  }
+  if (['pan_number', 'epic_number', 'dl_number', 'passport_number', 'ifsc_code', 'roll_number', 'jan_aadhaar_id', 'ration_card_number', 'consumer_number'].includes(key)) {
+    const v = String(value).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const t = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!v) return 0;
+    if (t.includes(v)) return 1;
+    // allow 1-character OCR slip
+    for (let i = 0; i + v.length <= t.length; i++) {
+      if (V.levenshtein(v, t.slice(i, i + v.length)) <= 1) return 0.8;
+    }
+    return 0;
+  }
+  if (['gender', 'caste_category', 'class', 'detected_doc_type', 'result', 'division'].includes(key)) return 1; // categorical, checked elsewhere
+  const tokens = normText(value).split(' ').filter((tk) => tk.length >= 2);
+  if (!tokens.length) return 0;
+  const textTokens = new Set(normText(raw).split(' '));
+  const textArr = [...textTokens];
+  const found = tokens.filter((tk) => textTokens.has(tk) || (tk.length >= 4 && textArr.some((u) => u.length >= 4 && Math.abs(u.length - tk.length) <= 1 && V.levenshtein(u, tk) <= 1))).length;
+  return found / tokens.length;
+}
 
-  // 1. Detect document type
-  const { type: detectedType, confidence: detectionConf } = detectDocumentType(ocrText);
-  const docType = hint || detectedType;
+// ── Normalising AI output into profile keys ──────────────────────────────────
 
-  console.log(`[Groq] Document type: ${docType} (detection confidence: ${detectionConf}%)`);
+const AI_KEY_MAP = {
+  name: 'name', name_hindi: 'name_hi', father_name: 'father_name', father_name_hindi: 'father_name_hi',
+  mother_name: 'mother_name', husband_name: 'husband_name', dob: 'dob', gender: 'gender',
+  address: 'address', address_hindi: 'address_hi', house_no: 'house_no', street: 'street',
+  village_city: 'village_city', post_office: 'post_office', tehsil: 'tehsil', district: 'district',
+  state: 'state', pincode: 'pincode', mobile: 'phone', email: 'email', pan_number: 'pan',
+  epic_number: 'voter_id', dl_number: 'driving_license', passport_number: 'passport_number',
+  place_of_birth: 'birth_place', blood_group: 'blood_group', ration_card_number: 'ration_card_number',
+  jan_aadhaar_id: 'jan_aadhaar_id', annual_income: 'annual_income', caste: 'caste',
+  caste_category: 'caste_category', religion: 'religion', bank_name: 'bank_name', ifsc_code: 'ifsc_code',
+  roll_number: '_marks_roll_number', board: '_marks_board', class: '_marks_class_level',
+  school_college: '_marks_school_college', school_place: '_marks_school_place',
+  year_of_passing: '_marks_year_of_passing', percentage: '_marks_percentage', division: '_marks_division',
+};
 
-  // 2. Build prompt
-  const prompt = buildPrompt(ocrText, docType);
+const EVIDENCE_KEYS = ['date_of_issue', 'bill_date', 'billing_month', 'date_of_expiry', 'valid_till', 'account_opening_date'];
 
-  // 3. Call Groq
-  let groqResult;
-  try {
-    groqResult = await callGroq(prompt, 1200);
-  } catch (err) {
-    console.error('[Groq] API call failed:', err.message);
-    return {
-      parsed: null,
-      docType,
-      confidence: 0,
-      groqUsed: false,
-      error: err.message,
-      processingMs: Date.now() - startTime,
+function cleanAiValue(key, value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'object') return null;
+  let s = String(value).trim();
+  if (!s || /^(null|n\/a|na|none|not available|-|unknown)$/i.test(s) || /X{4}/.test(s)) return null;
+  if (key === 'dob') return V.normaliseDate(s);
+  if (key === 'gender') {
+    if (/^f|महिला/i.test(s)) return 'Female';
+    if (/^t|ट्रांस/i.test(s)) return 'Transgender';
+    if (/^m|पुरुष/i.test(s)) return 'Male';
+    return null;
+  }
+  if (key === 'phone') { const m = V.normaliseMobile(s); return V.isValidMobile(m) ? m : null; }
+  if (key === 'pincode') { const d = V.digitsOnly(s); return V.isValidPincode(d) ? d : null; }
+  if (key === 'pan') { const p = s.toUpperCase().replace(/\s/g, ''); return V.isValidPAN(p) ? p : V.repairPAN(p); }
+  if (key === 'ifsc_code') { const p = s.toUpperCase().replace(/\s/g, ''); return V.isValidIFSC(p) ? p : null; }
+  if (key === 'annual_income') return V.parseAmount(s);
+  if (key === 'caste_category') {
+    const u = s.toUpperCase();
+    if (/\bST\b|TRIBE|जनजाति/.test(u)) return 'ST';
+    if (/\bSC\b|SCHEDULED CASTE|अनुसूचित जाति/.test(u)) return 'SC';
+    if (/MBC|MOST BACKWARD|अति पिछड़ा/.test(u)) return 'MBC';
+    if (/OBC|BACKWARD|पिछड़ा/.test(u)) return 'OBC';
+    if (/GEN|SAMANYA|सामान्य|EWS/.test(u)) return 'General';
+    return null;
+  }
+  if (/name$|_name$/.test(key) && !/_hi$/.test(key)) return V.titleCase(s);
+  if (key === '_marks_class_level') {
+    if (/12|xii|senior/i.test(s)) return '12';
+    if (/10|\bx\b|secondary|matric/i.test(s)) return '10';
+    if (/grad|b\.?a|b\.?sc|b\.?com|degree/i.test(s)) return 'graduate';
+    return null;
+  }
+  return s;
+}
+
+/**
+ * Parse OCR text with the AI.
+ * @returns {Promise<{ fields, meta, evidence, detectedType, tokens, ms, model, error? }>}
+ */
+async function parseWithAi(text, docType) {
+  const started = Date.now();
+  const masked = maskForAi(text);
+  const { content, usage } = await callGroq(buildMessages(masked, docType), { maxTokens: 900 });
+  const raw = parseJsonLoose(content);
+  const fields = {};
+  const meta = {};
+  const evidence = {};
+  for (const [aiKey, value] of Object.entries(raw)) {
+    if (EVIDENCE_KEYS.includes(aiKey)) {
+      const v = aiKey === 'billing_month' ? value : V.normaliseDate(value);
+      if (v && !/X{4}/.test(String(v))) evidence[aiKey] = v;
+      continue;
+    }
+    const key = AI_KEY_MAP[aiKey];
+    if (!key) continue;
+    const v = cleanAiValue(key, value);
+    if (v === null || v === undefined || v === '') continue;
+    const g = groundingScore(aiKey === 'mobile' ? 'phone' : aiKey, v, text);
+    fields[key] = v;
+    meta[key] = {
+      method: 'ai',
+      grounded: g >= 0.6,
+      grounding: Math.round(g * 100) / 100,
+      confidence: g >= 0.6 ? 0.85 : g >= 0.3 ? 0.6 : 0.35,
     };
   }
-
-  // 4. Parse JSON response
-  let parsed;
-  try {
-    parsed = parseGroqJSON(groqResult.content);
-  } catch (err) {
-    console.error('[Groq] JSON parse failed:', err.message);
-    console.error('[Groq] Raw response:', groqResult.content?.substring(0, 500));
-    return {
-      parsed: null,
-      docType,
-      confidence: 0,
-      groqUsed: true,
-      error: `JSON parse failed: ${err.message}`,
-      processingMs: Date.now() - startTime,
-    };
-  }
-
-  // 5. Normalize and return
-  const confidence = parsed.confidence || detectionConf || 70;
-  delete parsed.confidence; // Move to top-level
-
-  console.log(`[Groq] Parsed ${Object.keys(parsed).filter(k => parsed[k] !== null).length} fields in ${Date.now() - startTime}ms`);
-
   return {
-    parsed,
-    docType: parsed.doc_type || docType,
-    confidence,
-    groqUsed: true,
-    tokensUsed: groqResult.usage?.total_tokens || 0,
-    processingMs: Date.now() - startTime,
-    error: null,
+    fields, meta, evidence,
+    detectedType: typeof raw.detected_doc_type === 'string' ? raw.detected_doc_type : null,
+    tokens: usage.total_tokens || 0,
+    ms: Date.now() - started,
+    model: effectiveModel(),
   };
 }
 
-/**
- * Parse multiple documents and merge into a single profile.
- * Used for the batch upload flow.
- */
-async function parseMultipleDocuments(ocrResults) {
-  const results = [];
-
-  for (const { ocrText, filename, hint } of ocrResults) {
-    console.log(`[Groq] Processing: ${filename}`);
-    const result = await parseDocumentWithGroq(ocrText, hint);
-    results.push({ filename, ...result });
-
-    // Respect Groq rate limits: 30 req/min on free tier
-    if (ocrResults.length > 1) {
-      await new Promise(r => setTimeout(r, 500));
-    }
-  }
-
-  return results;
-}
-
-/**
- * Quick test to verify Groq API key is working.
- */
-async function testGroqConnection() {
+async function testConnection() {
   try {
-    const result = await callGroq('Return this JSON: {"status": "ok", "model": "working"}', 50);
-    const json = parseGroqJSON(result.content);
-    return { ok: true, model: GROQ_MODEL, response: json };
+    const { content } = await callGroq([
+      { role: 'system', content: 'Reply with JSON only.' },
+      { role: 'user', content: 'Return {"status":"ok"}' },
+    ], { maxTokens: 40 });
+    const json = parseJsonLoose(content);
+    return { ok: json.status === 'ok', model: effectiveModel(), configured_model: config.groq.model };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, model: effectiveModel(), error: err.message, code: err.code };
   }
 }
 
-module.exports = {
-  parseDocumentWithGroq,
-  parseMultipleDocuments,
-  detectDocumentType,
-  testGroqConnection,
-};
+/** Free-text answer for the operator's AI helper (context must be pre-masked). */
+async function askAssistant(question, context, lang = 'en') {
+  const { content } = await callGroq([
+    {
+      role: 'system',
+      content: `You help an eMitra kiosk operator in Rajasthan. Answer briefly and practically in ${lang === 'hi' ? 'simple Hindi' : 'simple English'}.
+Use only the customer data and rules given below. If something is not in the data, say so. Do not invent government rules, fees or deadlines — tell the operator to confirm on the official portal when unsure.
+
+DATA:
+${JSON.stringify(context, null, 1).slice(0, 6000)}`,
+    },
+    { role: 'user', content: String(question).slice(0, 1000) },
+  ], { maxTokens: 500, json: false, temperature: 0.3 });
+  return content || '';
+}
+
+module.exports = { maskForAi, parseWithAi, groundingScore, testConnection, askAssistant, effectiveModel, AiError, _internal: { buildMessages, cleanAiValue } };
