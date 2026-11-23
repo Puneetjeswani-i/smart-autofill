@@ -1,3 +1,7 @@
+/**
+ * LEGACY (v5) JSON store — no longer used by the app.
+ * Kept only so scripts/import-legacy.js can read old data. See db/index.js.
+ */
 const path = require('path');
 const fs = require('fs');
 
