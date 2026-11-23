@@ -17,7 +17,7 @@
  *   GET  /auth/digilocker/callback     -> real OAuth callback
  */
 
-require('dotenv').config();
+const { config } = require('../config');
 const express = require('express');
 const axios   = require('axios');
 const { v4: uuidv4 } = require('uuid');
@@ -35,11 +35,12 @@ function hasRealCredentials() {
   );
 }
 
+// The dashboard is served by this same server in v6.
 function frontendBase() {
-  return (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
+  return (process.env.FRONTEND_URL || `http://localhost:${config.port}`).replace(/\/$/, '');
 }
 function backendBase() {
-  return (process.env.BACKEND_URL || 'http://localhost:3001').replace(/\/$/, '');
+  return (process.env.BACKEND_URL || `http://localhost:${config.port}`).replace(/\/$/, '');
 }
 
 // ─── Simulated citizen profiles (realistic data for demo) ─────────────────────
@@ -99,7 +100,7 @@ router.get('/consent', (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DigiLocker – Sign In</title>
+<title>DigiLocker SIMULATION (demo only)</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -261,10 +262,10 @@ router.get('/consent', (req, res) => {
     <span style="font-size:28px;">🇮🇳</span>
     <div class="gov-bar-text">
       <strong>DigiLocker</strong>
-      Ministry of Electronics & Information Technology, Government of India
+      SIMULATION for demonstrations — this is NOT the real DigiLocker
     </div>
   </div>
-  <div style="margin-left:auto;font-size:11px;color:#888;">Secure • Official • Trusted</div>
+  <div style="margin-left:auto;font-size:11px;color:#b45309;font-weight:700;">DEMO ONLY</div>
 </div>
 
 <div class="card">
@@ -278,7 +279,7 @@ router.get('/consent', (req, res) => {
 
   <div class="card-body">
     <div class="demo-badge">
-      🧪 <strong>Simulation Mode</strong> — Real DigiLocker integration will be enabled after APISetu API approval. Judges: this demonstrates the complete OAuth flow.
+      🧪 <strong>Simulation Mode</strong> — this page imitates the OAuth flow for demonstrations only. Never use it with real customers. Real DigiLocker access is available only to approved APISetu partners.
     </div>
 
     <div class="requester-box">
@@ -344,9 +345,7 @@ router.get('/consent', (req, res) => {
 </div>
 
 <div class="footer">
-  DigiLocker is an initiative of MeitY, Government of India<br>
-  <a href="https://digilocker.gov.in" style="color:#2563a8;">digilocker.gov.in</a> &nbsp;|&nbsp;
-  All data is encrypted and secure
+  Simulated screen for demonstrations only — no real DigiLocker account is used.
 </div>
 
 <script>
